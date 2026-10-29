@@ -327,10 +327,10 @@ index be7fe08f34259..78be283352581 100644
  #if BUILDFLAG(CHROME_ROOT_STORE_SUPPORTED)
    config->trust_anchor_ids =
 diff --git a/chrome/browser/ui/layout_constants.cc b/chrome/browser/ui/layout_constants.cc
-index 9f6702af095c6..8314af2e3c79c 100644
+index daa15e961e825..924e9d681870c 100644
 --- a/chrome/browser/ui/layout_constants.cc
 +++ b/chrome/browser/ui/layout_constants.cc
-@@ -46,7 +46,11 @@ void SetLayoutConstantsFallback() {
+@@ -47,7 +47,11 @@ void SetLayoutConstantsFallback() {
      // to the white space above and below.
      layout_constant_values[(int)LayoutConstant::kBookmarkBarHeight] = layout_constant_values[(int)LayoutConstant::kBookmarkBarButtonHeight] 
                                                                   + 6;
@@ -338,7 +338,7 @@ index 9f6702af095c6..8314af2e3c79c 100644
 +       layout_constant_values[(int)LayoutConstant::kBookmarkBarHeight] = 30;
      layout_constant_values[(int)LayoutConstant::kBookmarkBarButtonPadding] = touch_ui ? 0 : 4;
 +    if (base::CommandLine::ForCurrentProcess()->HasSwitch("compact-ui"))
-+       layout_constant_values[(int)LayoutConstant::kBookmarkBarHeight] = 0;
++       layout_constant_values[(int)LayoutConstant::kBookmarkBarButtonPadding] = 0;
      layout_constant_values[(int)LayoutConstant::kBookmarkBarButtonImageLabelPadding] = 6;
      layout_constant_values[(int)LayoutConstant::kWebAppMenuButtonSize] = 24;
        // We must limit the size of icons in the title bar to avoid vertically
@@ -714,7 +714,7 @@ index 47d7e467d9ddd..fd09b31348cfc 100644
    flags.setStrokeWidth(stroke_width);
  
 diff --git a/chrome/browser/ui/views/frame/browser_view.cc b/chrome/browser/ui/views/frame/browser_view.cc
-index c5b196b2be317..3bacb333b963b 100644
+index 57610a98d512f..4019e26e705f2 100644
 --- a/chrome/browser/ui/views/frame/browser_view.cc
 +++ b/chrome/browser/ui/views/frame/browser_view.cc
 @@ -749,6 +749,9 @@ class BrowserView::ExclusiveAccessContextImpl
@@ -727,7 +727,7 @@ index c5b196b2be317..3bacb333b963b 100644
      // Trusted pinned mode does not allow to escape. So do not show the bubble.
      bool is_trusted_pinned =
          platform_util::IsBrowserLockedFullscreen(browser_view_->browser_.get());
-@@ -1767,6 +1770,13 @@ std::vector<StatusBubble*> BrowserView::GetStatusBubbles() {
+@@ -1772,6 +1775,13 @@ std::vector<StatusBubble*> BrowserView::GetStatusBubbles() {
  }
  
  void BrowserView::UpdateTitleBar() {
@@ -741,7 +741,58 @@ index c5b196b2be317..3bacb333b963b 100644
    browser_widget_->UpdateWindowTitle();
    if (web_app_window_title_) {
      DCHECK(GetIsWebAppType());
-@@ -4873,7 +4883,8 @@ void BrowserView::AddedToWidget() {
+@@ -4148,21 +4158,32 @@ void BrowserView::UpdateTabSearchBubbleHost() {
+     return;
+   }
+ 
++  // With --remove-tabsearch-button the tab strip has no Tab Search button
++  // (see TabStripComboButton::IsTabSearchPinned()), so don't attach a bubble
++  // host to it.
++  const bool remove_tab_search_button =
++      base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "remove-tabsearch-button");
++
+   auto* vertical_tab_strip_state_controller =
+       tabs::VerticalTabStripStateController::From(browser_);
+   if (vertical_tab_strip_state_controller &&
+       vertical_tab_strip_state_controller->ShouldDisplayVerticalTabs()) {
+-    auto* combo_button =
+-        vertical_tab_strip_region_view_->GetTopContainer()->GetComboButton();
+-    tab_search_bubble_host_ = std::make_unique<TabSearchBubbleHost>(
+-        combo_button->end_button(), browser_.get());
+-    combo_button->SetTabSearchBubbleHost(tab_search_bubble_host_.get());
++    if (!remove_tab_search_button) {
++      auto* combo_button =
++          vertical_tab_strip_region_view_->GetTopContainer()->GetComboButton();
++      tab_search_bubble_host_ = std::make_unique<TabSearchBubbleHost>(
++          combo_button->end_button(), browser_.get());
++      combo_button->SetTabSearchBubbleHost(tab_search_bubble_host_.get());
++    }
+   } else if (base::FeatureList::IsEnabled(
+                  tabs::kHorizontalTabStripComboButton)) {
+-    auto* combo_button = horizontal_tab_strip_region_view_->GetComboButton();
+-    tab_search_bubble_host_ = std::make_unique<TabSearchBubbleHost>(
+-        combo_button->end_button(), browser_.get());
+-    combo_button->SetTabSearchBubbleHost(tab_search_bubble_host_.get());
++    if (!remove_tab_search_button) {
++      auto* combo_button = horizontal_tab_strip_region_view_->GetComboButton();
++      tab_search_bubble_host_ = std::make_unique<TabSearchBubbleHost>(
++          combo_button->end_button(), browser_.get());
++      combo_button->SetTabSearchBubbleHost(tab_search_bubble_host_.get());
++    }
+   } else if (tabs::GetTabSearchPosition(browser_) ==
+              tabs::TabSearchPosition::kToolbarButton) {
+     tab_search_bubble_host_ = std::make_unique<TabSearchBubbleHost>(
+@@ -4171,7 +4192,7 @@ void BrowserView::UpdateTabSearchBubbleHost() {
+         TabSearchToolbarButtonController::From(browser_.get());
+     CHECK(toolbar_button_controller);
+     toolbar_button_controller->UpdateBubbleHost(tab_search_bubble_host_.get());
+-  } else {
++  } else if (!remove_tab_search_button) {
+     tab_search_bubble_host_ = std::make_unique<TabSearchBubbleHost>(
+         BrowserElementsViews::From(browser_.get())
+             ->GetViewAs<TabSearchButton>(kTabSearchButtonElementId),
+@@ -4878,7 +4899,8 @@ void BrowserView::AddedToWidget() {
    // rather than Init() as it depends on the browser frame being ready.
    // It also needs to be after the |toolbar_| had been initialized since it uses
    // the omnibox.
@@ -1228,7 +1279,7 @@ index e6d325dbdd327..37fe9dff5bdb6 100644
    std::string header_value =
        base::FeatureList::IsEnabled(blink::features::kJXLImageFormat)
 diff --git a/content/renderer/render_frame_impl.cc b/content/renderer/render_frame_impl.cc
-index 9d3eb74e4d5da..53e922f2726c3 100644
+index 9d3eb74e4d5da..bd9377634d70d 100644
 --- a/content/renderer/render_frame_impl.cc
 +++ b/content/renderer/render_frame_impl.cc
 @@ -1249,6 +1249,8 @@ WindowOpenDisposition NavigationPolicyToDisposition(
@@ -1240,13 +1291,17 @@ index 9d3eb74e4d5da..53e922f2726c3 100644
        return WindowOpenDisposition::NEW_POPUP;
      case blink::kWebNavigationPolicyPictureInPicture:
        return WindowOpenDisposition::NEW_PICTURE_IN_PICTURE;
-@@ -2286,13 +2288,13 @@ void RenderFrameImpl::Delete(mojom::FrameDeleteIntention intent) {
+@@ -2286,13 +2288,17 @@ void RenderFrameImpl::Delete(mojom::FrameDeleteIntention intent) {
        // main frame when a commit (and ownership transfer) is imminent.
        // TODO(dcheng): This is the case of https://crbug.com/838348.
        DCHECK(is_main_frame_);
 -#if !BUILDFLAG(IS_ANDROID)
 +#if !BUILDFLAG(IS_ANDROID) && !BUILDFLAG(IS_WIN)
        CHECK(!in_frame_tree_);
++#elif BUILDFLAG(IS_WIN)
++      // Supermium: don't crash the renderer here on Windows, as was done on
++      // Android before this CHECK() was enabled there as well.
++      DUMP_WILL_BE_CHECK(!in_frame_tree_);
  #else
        // Previously this CHECK() was disabled on Android because it was much
        // easier to hit the race there.
@@ -1332,10 +1387,10 @@ index ac068eee56b03..b1d419c043aab 100644
    if (ExtensionsBrowserClient::Get()->AllowCrossRendererResourceLoad(
            request, destination, page_transition, child_id, is_incognito,
 diff --git a/extensions/browser/extension_util.cc b/extensions/browser/extension_util.cc
-index 3e02498993436..e8df047adde40 100644
+index 6b50d16490f08..ee0f54d80b3fe 100644
 --- a/extensions/browser/extension_util.cc
 +++ b/extensions/browser/extension_util.cc
-@@ -575,6 +575,14 @@ bool AnyCurrentlyInstalledExtensionIsFromWebstore(
+@@ -576,6 +576,14 @@ bool AnyCurrentlyInstalledExtensionIsFromWebstore(
                               });
  }
  
@@ -1350,12 +1405,12 @@ index 3e02498993436..e8df047adde40 100644
  bool IsExtensionDownload(const download::DownloadItem& download_item) {
    if (download_item.GetTargetDisposition() ==
        download::DownloadItem::TARGET_DISPOSITION_PROMPT) {
-@@ -584,7 +592,7 @@ bool IsExtensionDownload(const download::DownloadItem& download_item) {
+@@ -585,7 +593,7 @@ bool IsExtensionDownload(const download::DownloadItem& download_item) {
    if (download_item.GetMimeType() == Extension::kMimeType ||
        UserScript::IsURLUserScript(download_item.GetURL(),
                                    download_item.GetMimeType())) {
 -    return true;
-+    return ShouldDownloadAsRegularFile();
++    return !ShouldDownloadAsRegularFile();
    }
    return false;
  }
@@ -1459,7 +1514,7 @@ index 0fe5b9adbb6db..8ff58c1983884 100644
    if (WebRtcToMediaVideoCodec(video_codec_type) == media::VideoCodec::kUnknown)
      return nullptr;
 diff --git a/ui/base/mojom/window_open_disposition_mojom_traits.h b/ui/base/mojom/window_open_disposition_mojom_traits.h
-index 5a248db1eb26d..58e5afc32a1e1 100644
+index 5a248db1eb26d..3f3fa4f7a64f3 100644
 --- a/ui/base/mojom/window_open_disposition_mojom_traits.h
 +++ b/ui/base/mojom/window_open_disposition_mojom_traits.h
 @@ -5,6 +5,7 @@
@@ -1479,6 +1534,16 @@ index 5a248db1eb26d..58e5afc32a1e1 100644
          return ui::mojom::WindowOpenDisposition::NEW_POPUP;
        case WindowOpenDisposition::NEW_WINDOW:
          return ui::mojom::WindowOpenDisposition::NEW_WINDOW;
+@@ -63,6 +66,9 @@ struct EnumTraits<ui::mojom::WindowOpenDisposition, WindowOpenDisposition> {
+       case ui::mojom::WindowOpenDisposition::NEW_PICTURE_IN_PICTURE:
+         return WindowOpenDisposition::NEW_PICTURE_IN_PICTURE;
+       case ui::mojom::WindowOpenDisposition::NEW_POPUP:
++        // Checked here too, since only the browser process has the switch.
++        if (base::CommandLine::ForCurrentProcess()->HasSwitch("popups-to-tabs"))
++          return WindowOpenDisposition::NEW_FOREGROUND_TAB;
+         return WindowOpenDisposition::NEW_POPUP;
+       case ui::mojom::WindowOpenDisposition::NEW_WINDOW:
+         return WindowOpenDisposition::NEW_WINDOW;
 diff --git a/ui/compositor/compositor.cc b/ui/compositor/compositor.cc
 index e54319f95c7db..954d3322476c7 100644
 --- a/ui/compositor/compositor.cc
@@ -1525,3 +1590,192 @@ index 7151faefd2c98..6e272f16542fe 100644
      if (base::FeatureList::IsEnabled(
              features::kUseGammaContrastRegistrySettings)) {
        params_->text_contrast = FontUtilWin::GetContrastFromRegistry();
+diff --git a/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc b/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
+index 63985d1fed4c9..0a1124e80a0fc 100644
+--- a/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.h"
+ 
++#include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/strings/utf_string_conversions.h"
+@@ -288,7 +289,9 @@ HorizontalTabStripRegionView::HorizontalTabStripRegionView(
+       tab_strip_action_container->SetProperty(views::kCrossAxisAlignmentKey,
+                                               views::LayoutAlignment::kStart);
+     } else if (!base::FeatureList::IsEnabled(
+-                   tabs::kHorizontalTabStripComboButton)) {
++                   tabs::kHorizontalTabStripComboButton) &&
++               !base::CommandLine::ForCurrentProcess()->HasSwitch(
++                   "remove-tabsearch-button")) {
+       tab_search_button =
+           std::make_unique<TabSearchButton>(browser, Edge::kNone, Edge::kNone);
+       tab_search_button->SetProperty(views::kCrossAxisAlignmentKey,
+diff --git a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc
+index 8ec6ffa9671fc..de817ba844441 100644
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.h"
+ 
++#include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -158,9 +159,15 @@ bool BrowserViewLayoutDelegateImpl::IsActiveTabSplit() const {
+ 
+ bool BrowserViewLayoutDelegateImpl::IsActiveTabAtLeadingWindowEdge() const {
+   if (auto* const frame = GetFrameView()) {
++    // --remove-tabsearch-button removes the leading Tab Search button: no
++    // TabSearchButton is created in HorizontalTabStripRegionView, and the
++    // combo button hides its Tab Search part (see
++    // TabStripComboButton::IsTabSearchPinned()).
+     bool has_leading_search_button =
+         tabs::GetTabSearchPosition(browser_view_->browser()) ==
+-        tabs::TabSearchPosition::kLeadingHorizontalTabstrip;
++            tabs::TabSearchPosition::kLeadingHorizontalTabstrip &&
++        !base::CommandLine::ForCurrentProcess()->HasSwitch(
++            "remove-tabsearch-button");
+     if (base::FeatureList::IsEnabled(tabs::kHorizontalTabStripComboButton)) {
+       // Tab search button can be unpinned so including it in the determination
+       // of leading edge of horizontal tab strip.
+diff --git a/chrome/browser/ui/views/frame/system_menu_model_builder.cc b/chrome/browser/ui/views/frame/system_menu_model_builder.cc
+index 0f9cfbf788245..086c5cf011052 100644
+--- a/chrome/browser/ui/views/frame/system_menu_model_builder.cc
++++ b/chrome/browser/ui/views/frame/system_menu_model_builder.cc
+@@ -158,7 +158,13 @@ void SystemMenuModelBuilder::BuildSystemMenuForBrowserWindow(
+                        kNameWindowOldIcon);
+ #endif  // BUILDFLAG(IS_MAC)
+ 
+-  if (base::FeatureList::IsEnabled(tabs::kHorizontalTabStripComboButton)) {
++  // --remove-tabsearch-button disables IDC_TAB_SEARCH_TOGGLE_PIN (see
++  // BrowserCommandController), so don't offer to pin or unpin Tab Search.
++  const bool show_tab_search_pin =
++      base::FeatureList::IsEnabled(tabs::kHorizontalTabStripComboButton) &&
++      !base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "remove-tabsearch-button");
++  if (show_tab_search_pin) {
+     model->AddSeparator(ui::NORMAL_SEPARATOR);
+     model->AddItemWithStringId(IDC_TAB_SEARCH_TOGGLE_PIN,
+                                IDS_TAB_STRIP_PIN_TAB_SEARCH);
+@@ -169,7 +175,7 @@ void SystemMenuModelBuilder::BuildSystemMenuForBrowserWindow(
+   // the glic toggle option if glic is enabled when building the menu.
+   if (glic::GlicEnabling::IsEnabledForProfile(browser()->profile())) {
+ #endif  // BUILDFLAG(IS_WIN)
+-    if (!base::FeatureList::IsEnabled(tabs::kHorizontalTabStripComboButton)) {
++    if (!show_tab_search_pin) {
+       model->AddSeparator(ui::NORMAL_SEPARATOR);
+     }
+     model->AddItemWithStringId(IDC_GLIC_TOGGLE_PIN, IDS_GLIC_PIN);
+diff --git a/chrome/browser/ui/views/tabs/shared/tab_strip_combo_button.cc b/chrome/browser/ui/views/tabs/shared/tab_strip_combo_button.cc
+index ca6e255c21251..ba429bb16fc7c 100644
+--- a/chrome/browser/ui/views/tabs/shared/tab_strip_combo_button.cc
++++ b/chrome/browser/ui/views/tabs/shared/tab_strip_combo_button.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/views/tabs/shared/tab_strip_combo_button.h"
+ 
++#include "base/command_line.h"
+ #include "base/i18n/rtl.h"
+ #include "base/metrics/user_metrics.h"
+ #include "base/metrics/user_metrics_action.h"
+@@ -465,6 +466,11 @@ void TabStripComboButton::MaybeHideTabSearchButton() {
+ }
+ 
+ bool TabStripComboButton::IsTabSearchPinned() {
++  // --remove-tabsearch-button keeps the Tab Search (end) button hidden.
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "remove-tabsearch-button")) {
++    return false;
++  }
+   PrefService* prefs = browser_->GetProfile()->GetPrefs();
+   return prefs->GetBoolean(prefs::kTabSearchPinnedToTabstrip) &&
+          !tabs::kHorizontalTabStripComboButtonShowStartOnly.Get();
+diff --git a/components/search_engines/template_url_fetcher.cc b/components/search_engines/template_url_fetcher.cc
+index 34bdaf000512f..e92e2d4de3eb8 100644
+--- a/components/search_engines/template_url_fetcher.cc
++++ b/components/search_engines/template_url_fetcher.cc
+@@ -8,6 +8,7 @@
+ #include <optional>
+ #include <string>
+ 
++#include "base/command_line.h"
+ #include "base/functional/bind.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+@@ -256,6 +257,14 @@ void TemplateURLFetcher::ScheduleDownload(
+   DCHECK(osdd_url.is_valid());
+   DCHECK(!keyword.empty());
+ 
++  // With --disable-search-engine-collection the description could only be
++  // rejected after the download (see CanAddAutogeneratedKeyword()), so don't
++  // fetch it at all.
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "disable-search-engine-collection")) {
++    return;
++  }
++
+   if (!template_url_service_->loaded()) {
+     // We could try to set up a callback to this function again once the model
+     // is loaded but meh.
+diff --git a/components/search_engines/template_url_service.cc b/components/search_engines/template_url_service.cc
+index daf9e2d7df995..890daf431351b 100644
+--- a/components/search_engines/template_url_service.cc
++++ b/components/search_engines/template_url_service.cc
+@@ -15,6 +15,7 @@
+ #include "base/base64url.h"
+ #include "base/check_deref.h"
+ #include "base/check_is_test.h"
++#include "base/command_line.h"
+ #include "base/containers/fixed_flat_map.h"
+ #include "base/containers/flat_map.h"
+ #include "base/debug/crash_logging.h"
+@@ -194,6 +195,12 @@ bool ShouldMergeEnterpriseSearchEnginesActiveStatus(
+          existing_data.is_active != new_values.is_active();
+ }
+ 
++bool ShouldAutocollect() {
++  const base::CommandLine& command_line =
++    *base::CommandLine::ForCurrentProcess();
++  return !command_line.HasSwitch("disable-search-engine-collection");
++}
++
+ // Checks if `new_values` has updated versions of `existing_turl`. Only fields
+ // set by the search engine policies are checked.
+ bool ShouldMergeEnterpriseSearchEngines(const TemplateURL& existing_turl,
+@@ -667,6 +674,10 @@ bool TemplateURLService::CanAddAutogeneratedKeyword(
+   DCHECK(!keyword.empty());  // This should only be called for non-empty
+                              // keywords. If we need to support empty keywords
+                              // the code needs to change slightly.
++  // With --disable-search-engine-collection, never add or replace
++  // auto-collected engines, including ones collected before.
++  if (!should_autocollect_)
++    return false;
+   const TemplateURL* existing_url = GetTemplateURLForKeyword(keyword);
+   if (existing_url) {
+     // TODO(tommycli): Currently, this code goes one step beyond
+@@ -2613,6 +2624,8 @@ SyncDataMap TemplateURLService::CreateGUIDToSyncDataMap(
+ }
+ 
+ void TemplateURLService::Init() {
++  should_autocollect_ = ShouldAutocollect();
++
+   if (client_) {
+     client_->SetOwner(this);
+   }
+diff --git a/components/search_engines/template_url_service.h b/components/search_engines/template_url_service.h
+index f15f7e800dc75..399b27883cea2 100644
+--- a/components/search_engines/template_url_service.h
++++ b/components/search_engines/template_url_service.h
+@@ -982,6 +982,8 @@ class TemplateURLService final : public WebDataServiceConsumer,
+   // ---------- Browser state related members ---------------------------------
+   raw_ref<PrefService> prefs_;
+ 
++  bool should_autocollect_ = true;  // Whether search engines should be auto-collected
++
+   raw_ref<search_engines::SearchEngineChoiceService>
+       search_engine_choice_service_;
+ 

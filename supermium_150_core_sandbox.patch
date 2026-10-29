@@ -41,7 +41,7 @@ index 1b87649d48f1c..c3cb672ca7ce3 100644
      return Sandbox::kGpu;
    }
 diff --git a/sandbox/policy/win/sandbox_win.cc b/sandbox/policy/win/sandbox_win.cc
-index 1d798fecab6c7..9ec89be806e75 100644
+index 1d798fecab6c7..27d0f3dcbbe56 100644
 --- a/sandbox/policy/win/sandbox_win.cc
 +++ b/sandbox/policy/win/sandbox_win.cc
 @@ -223,7 +223,9 @@ ResultCode AddDefaultConfigForSandboxedProcess(TargetConfig* config) {
@@ -55,7 +55,19 @@ index 1d798fecab6c7..9ec89be806e75 100644
    config->SetDesktop(Desktop::kAlternateWinstation);
  
    return SBOX_ALL_OK;
-@@ -627,12 +629,18 @@ ResultCode LaunchWithoutSandbox(
+@@ -529,7 +531,10 @@ ResultCode GenerateConfigForSandboxedProcess(const base::CommandLine& cmd_line,
+   if (sandbox_type == Sandbox::kRenderer) {
+     // TODO(crbug.com/40088338) Remove if we can reliably not load
+     // cryptbase.dll.
+-    config->AddKernelObjectToClose(HandleToClose::kKsecDD);
++    // Chromium versions that supported Windows 7 and 8 never closed KsecDD,
++    // which cryptbase.dll uses for RtlGenRandom(), so keep it open there.
++    if (base::win::GetVersion() >= base::win::Version::WIN8_1)
++      config->AddKernelObjectToClose(HandleToClose::kKsecDD);
+     if (const auto result = SandboxWin::AddWin32kLockdownPolicy(config);
+         result != SBOX_ALL_OK) {
+       return result;
+@@ -627,12 +632,18 @@ ResultCode LaunchWithoutSandbox(
    // on process shutdown, in which case TerminateProcess can fail. See
    // https://crbug.com/820996.
    if (delegate->ShouldUnsandboxedRunInJob()) {
@@ -74,7 +86,7 @@ index 1d798fecab6c7..9ec89be806e75 100644
    }
  
    // Chromium binaries are marked as CET Compatible but some processes
-@@ -725,6 +733,9 @@ void SandboxWin::AddBaseHandleClosePolicy(TargetConfig* config) {
+@@ -725,6 +736,9 @@ void SandboxWin::AddBaseHandleClosePolicy(TargetConfig* config) {
  ResultCode SandboxWin::AddAppContainerPolicy(TargetConfig* config,
                                               base::wcstring_view sid) {
    DCHECK(!config->IsConfigured());
@@ -85,10 +97,105 @@ index 1d798fecab6c7..9ec89be806e75 100644
      ResultCode result = config->SetLowBox(sid);
      if (result != SBOX_ALL_OK) {
 diff --git a/sandbox/win/src/broker_services.cc b/sandbox/win/src/broker_services.cc
-index 0b3de828ecec1..861fda525b26a 100644
+index 0b3de828ecec1..1ba478f7f726a 100644
 --- a/sandbox/win/src/broker_services.cc
 +++ b/sandbox/win/src/broker_services.cc
-@@ -553,7 +553,11 @@ BrokerServicesBase::PreSpawnTarget(PolicyBase* policy_base) {
+@@ -82,6 +82,11 @@ struct JobTracker {
+   JobTracker(std::unique_ptr<sandbox::PolicyBase> policy, DWORD process_id)
+       : policy(std::move(policy)), process_id(process_id) {}
+   ~JobTracker() {
++    // Stop watching a target that runs outside of its job. This waits for a
++    // callback that is still running, so it never sees a freed tracker.
++    if (wait_handle) {
++      ::UnregisterWaitEx(wait_handle, INVALID_HANDLE_VALUE);
++    }
+     // As if TerminateProcess() was called for all associated processes.
+     // Handles are still valid.
+     ::TerminateJobObject(policy->GetJobHandle(), sandbox::SBOX_ALL_OK);
+@@ -89,8 +94,24 @@ struct JobTracker {
+ 
+   std::unique_ptr<sandbox::PolicyBase> policy;
+   DWORD process_id;
++  // Only valid for a target that couldn't be assigned to its job (Windows 7
++  // and older, broker in a job which doesn't allow breaking away). That job
++  // never reports JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO, so TargetEventsThread()
++  // waits on the target itself instead.
++  base::win::ScopedHandle unjobbed_process;
++  HANDLE iocp = nullptr;
++  HANDLE wait_handle = nullptr;
+ };
+ 
++// Runs on a thread pool thread when a target that runs outside of its job
++// exits, and reports this the way the job would have.
++void CALLBACK UnjobbedTargetExited(PVOID param, BOOLEAN /*timed_out*/) {
++  JobTracker* tracker = static_cast<JobTracker*>(param);
++  ::PostQueuedCompletionStatus(tracker->iocp,
++                               JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO,
++                               reinterpret_cast<ULONG_PTR>(tracker), nullptr);
++}
++
+ // Helper class to send policy lists
+ class PolicyDiagnosticList final : public sandbox::PolicyList {
+  public:
+@@ -217,6 +238,20 @@ DWORD WINAPI TargetEventsThread(PVOID param) {
+       tracker.reset(reinterpret_cast<JobTracker*>(ovl));
+       DCHECK(tracker->policy->HasJob());
+ 
++      // The target runs outside of its job, so its exit is reported by
++      // UnjobbedTargetExited() instead of the job. The wait is registered on
++      // this thread, so the notification is handled only after the tracker
++      // has been added to `jobs`.
++      if (tracker->unjobbed_process.is_valid()) {
++        tracker->iocp = params->iocp;
++        if (!::RegisterWaitForSingleObject(
++                &tracker->wait_handle, tracker->unjobbed_process.get(),
++                UnjobbedTargetExited, tracker.get(), INFINITE,
++                WT_EXECUTEONLYONCE)) {
++          tracker->wait_handle = nullptr;
++        }
++      }
++
+       jobs.push_back(std::move(tracker));
+     } else if (THREAD_CTRL_GET_POLICY_INFO == key) {
+       // Clone the policies for sandbox diagnostics.
+@@ -258,6 +293,22 @@ bool CheckImpersonationToken(HANDLE thread) {
+   return !token->IsIdentification();
+ }
+ 
++// Returns true if the broker runs inside a job which allows its children to
++// break away from it.
++bool BrokerJobAllowsBreakaway() {
++  BOOL in_job = FALSE;
++  if (!::IsProcessInJob(::GetCurrentProcess(), nullptr, &in_job) || !in_job) {
++    return false;
++  }
++  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {};
++  if (!::QueryInformationJobObject(nullptr, JobObjectExtendedLimitInformation,
++                                   &limits, sizeof(limits), nullptr)) {
++    return false;
++  }
++  return limits.BasicLimitInformation.LimitFlags &
++         JOB_OBJECT_LIMIT_BREAKAWAY_OK;
++}
++
+ // Creates the target (child) process suspended and assigns it to the job
+ // object. The `command_line` parameter is intentionally not const so that
+ // it can be passed directly to CreateProcessAsUser.
+@@ -277,6 +328,13 @@ ResultCode CreateSandboxProcess(
+   if (startup_info->has_extended_startup_info()) {
+     flags |= EXTENDED_STARTUPINFO_PRESENT;
+   }
++  // Windows 7 and older can't nest jobs. If the broker itself runs in a job,
++  // the target has to break away from it so that it can be assigned to its own
++  // sandbox job in FinishSpawnTargetImpl().
++  if (base::win::GetVersion() < base::win::Version::WIN8 &&
++      BrokerJobAllowsBreakaway()) {
++    flags |= CREATE_BREAKAWAY_FROM_JOB;
++  }
+   bool inherit_handles = startup_info_helper->ShouldInheritHandles();
+   PROCESS_INFORMATION temp_process_info = {};
+   std::wstring args = command_line.GetCommandLineString();
+@@ -553,7 +611,11 @@ BrokerServicesBase::PreSpawnTarget(PolicyBase* policy_base) {
      startup_info->SetAppContainer(container);
    }
  
@@ -101,8 +208,71 @@ index 0b3de828ecec1..861fda525b26a 100644
  
    if (!startup_info->BuildStartupInformation()) {
      return base::unexpected(SBOX_ERROR_PROC_THREAD_ATTRIBUTES);
+@@ -631,6 +693,36 @@ ResultCode BrokerServicesBase::FinishSpawnTargetImpl(
+     return initial_result;
+   }
+ 
++  // Before Windows 10 the job can't be associated through the startup
++  // information (see PreSpawnTarget()), so assign the still suspended target to
++  // it here. Otherwise the target runs without the limits of the job, and the
++  // JobTracker created below is never released, since the job never reports
++  // JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO.
++  base::win::ScopedHandle unjobbed_process;
++  if (base::win::GetVersion() < base::win::Version::WIN10 &&
++      policy_base->HasJob() &&
++      !::AssignProcessToJobObject(policy_base->GetJobHandle(),
++                                  process_info.process_handle())) {
++    if (base::win::GetVersion() >= base::win::Version::WIN8) {
++      last_error = ::GetLastError();
++      ::TerminateProcess(process_info.process_handle(), 0);
++      return SBOX_ERROR_ASSIGN_PROCESS_TO_JOB_OBJECT;
++    }
++    // Windows 7 and older can't nest jobs, so this fails if the broker runs in
++    // a job which doesn't allow breaking away. Keep running without the job
++    // there, as before, but keep a handle to wait on the target itself, so
++    // that its JobTracker is still released when it exits.
++    HANDLE dup_process = nullptr;
++    if (!::DuplicateHandle(::GetCurrentProcess(), process_info.process_handle(),
++                           ::GetCurrentProcess(), &dup_process, SYNCHRONIZE,
++                           FALSE, 0)) {
++      last_error = ::GetLastError();
++      ::TerminateProcess(process_info.process_handle(), 0);
++      return SBOX_ERROR_CANNOT_DUPLICATE_PROCESS_HANDLE;
++    }
++    unjobbed_process.Set(dup_process);
++  }
++
+   ResultCode result = policy_base->InitProcess(process_info.process_handle(),
+                                                thread_pool_, last_error);
+   if (result != SBOX_ALL_OK) {
+@@ -639,8 +731,14 @@ ResultCode BrokerServicesBase::FinishSpawnTargetImpl(
+   }
+ 
+   HANDLE job_handle = policy_base->GetJobHandle();
++  // A target that runs outside of its job can exit, and TargetEventsThread()
++  // can then free its tracker and close `job_handle`, as soon as the tracker
++  // is posted below. Its job stays empty and never reports anything, so it is
++  // not associated with the port at all.
++  const bool unjobbed = unjobbed_process.is_valid();
+   JobTracker* tracker =
+       new JobTracker(std::move(policy_base), process_info.process_id());
++  tracker->unjobbed_process = std::move(unjobbed_process);
+ 
+   // Post the tracker to the tracking thread, then associate the job with
+   // the tracker. The worker thread takes ownership of these objects.
+@@ -648,7 +746,9 @@ ResultCode BrokerServicesBase::FinishSpawnTargetImpl(
+                                      THREAD_CTRL_NEW_JOB_TRACKER,
+                                      reinterpret_cast<LPOVERLAPPED>(tracker)));
+   // There is no obvious cleanup here.
+-  CHECK(AssociateCompletionPort(job_handle, job_port_.get(), tracker));
++  if (!unjobbed) {
++    CHECK(AssociateCompletionPort(job_handle, job_port_.get(), tracker));
++  }
+ 
+   return result;
+ }
 diff --git a/sandbox/win/src/handle_closer_agent.cc b/sandbox/win/src/handle_closer_agent.cc
-index 047fe689715a1..996329a077206 100644
+index 047fe689715a1..f5415c24961a3 100644
 --- a/sandbox/win/src/handle_closer_agent.cc
 +++ b/sandbox/win/src/handle_closer_agent.cc
 @@ -18,6 +18,7 @@
@@ -113,22 +283,36 @@ index 047fe689715a1..996329a077206 100644
  #include "sandbox/win/src/heap_helper.h"
  #include "sandbox/win/src/win_utils.h"
  
-@@ -166,6 +167,13 @@ bool HandleCloserAgent::CloseHandles() {
+@@ -166,6 +167,27 @@ bool HandleCloserAgent::CloseHandles() {
      return false;
    }
  
-+  if (base::win::GetVersion() < base::win::Version::WIN8_1)  {
-+	if(GetCurrentProcessHandlesWin7())
-+		return true;
-+	else
-+		return false;
++  if (base::win::GetVersion() < base::win::Version::WIN8_1) {
++    // NtQueryInformationProcess(ProcessHandleTable) is not available before
++    // Windows 8.1, so find the handles by brute force and close the ones that
++    // are configured, like the code below does. ALPC ports are left alone:
++    // disconnecting from CSRSS is only supported on Windows 10 and later.
++    std::optional<ProcessHandleMap> handle_map = GetCurrentProcessHandlesWin7();
++    if (!handle_map) {
++      return false;
++    }
++    for (const auto& [type, handles] : *handle_map) {
++      if (type == kALPCPort) {
++        continue;
++      }
++      std::wstring type_name = type;
++      for (HANDLE handle : handles) {
++        MaybeCloseHandle(type_name, handle);
++      }
++    }
++    return true;
 +  }
 +
    // The system call will return only handles up to the buffer size so add a
    // margin of error of an additional 1000 handles.
    auto handles = base::HeapArray<uint32_t>::WithSize(handle_count + 1000);
 diff --git a/sandbox/win/src/interception.cc b/sandbox/win/src/interception.cc
-index d074722947cb1..23d2526d8e5d4 100644
+index d074722947cb1..cb6101a7414a5 100644
 --- a/sandbox/win/src/interception.cc
 +++ b/sandbox/win/src/interception.cc
 @@ -21,6 +21,7 @@
@@ -139,7 +323,7 @@ index d074722947cb1..23d2526d8e5d4 100644
  #include "sandbox/win/src/interception_internal.h"
  #include "sandbox/win/src/interceptors.h"
  #include "sandbox/win/src/internal_types.h"
-@@ -394,7 +395,39 @@ InterceptionManager::PatchClientFunctions(DllInterceptionData* thunks,
+@@ -394,7 +395,40 @@ InterceptionManager::PatchClientFunctions(DllInterceptionData* thunks,
    patch.dll_data.num_thunks = 0;
    patch.dll_data.used_bytes = offsetof(DllInterceptionData, thunks);
  
@@ -148,8 +332,6 @@ index d074722947cb1..23d2526d8e5d4 100644
 +#if defined(_WIN64)
 +  thunk = std::make_unique<ServiceResolverThunk>(child_->Process(), true);
 +#else
-+  DWORD base_code = 0;
-+  DWORD bytes_read = 0;
 +  base::win::OSInfo* os_info = base::win::OSInfo::GetInstance();
 +  base::win::Version real_os_version = os_info->Kernel32Version();
 +  if (os_info->IsWowX86OnAMD64()) {
@@ -159,18 +341,21 @@ index d074722947cb1..23d2526d8e5d4 100644
 +      thunk.reset(new Wow64W8ResolverThunk(child_->Process(), true));
 +    else {
 +      thunk.reset(new Wow64ResolverThunk(child_->Process(), true));
-+	  if(!::ReadProcessMemory(child_->Process(), ntdll_base, &base_code,
-+			sizeof(base_code), &bytes_read)) {
-+				if(::GetLastError() == ERROR_PARTIAL_COPY) {
-+					//::ResumeThread(child_->MainThread());
-+					while(!::ReadProcessMemory(child_->Process(), ntdll_base, &base_code,
-+						sizeof(base_code), &bytes_read)) {
-+						;
-+					}
-+					//::SuspendThread(child_->MainThread());
-+					}
-+			}
-+	}
++      // Before Windows 8, ntdll of a freshly created WOW64 target can briefly
++      // be unreadable (ERROR_PARTIAL_COPY). Wait for it, but not forever, so
++      // that a target which never becomes readable can't hang the broker:
++      // thunk->Setup() below then reports the failure instead.
++      DWORD base_code = 0;
++      SIZE_T bytes_read = 0;
++      for (int attempt = 0;
++           attempt < 200 &&
++           !::ReadProcessMemory(child_->Process(), ntdll_base, &base_code,
++                                sizeof(base_code), &bytes_read) &&
++           ::GetLastError() == ERROR_PARTIAL_COPY;
++           ++attempt) {
++        ::Sleep(1);
++      }
++    }
 +  } else if (real_os_version >= base::win::Version::WIN8) {
 +    thunk.reset(new Win8ResolverThunk(child_->Process(), true));
 +  } else {
@@ -180,7 +365,7 @@ index d074722947cb1..23d2526d8e5d4 100644
  
    patch.originals = {};
    for (const auto& interception : interceptions_) {
-@@ -406,7 +439,7 @@ InterceptionManager::PatchClientFunctions(DllInterceptionData* thunks,
+@@ -406,7 +440,7 @@ InterceptionManager::PatchClientFunctions(DllInterceptionData* thunks,
        return base::unexpected(SBOX_ERROR_BAD_PARAMS);
  
      NTSTATUS ret =
@@ -383,7 +568,7 @@ index cdfc19035bcb1..85ef35a37d9d7 100644
  
  #endif  // SANDBOX_WIN_SRC_SERVICE_RESOLVER_H_
 diff --git a/sandbox/win/src/service_resolver_32.cc b/sandbox/win/src/service_resolver_32.cc
-index 7f6bf39c6e17b..0c84a6c0af207 100644
+index 7f6bf39c6e17b..5594176fa3d2f 100644
 --- a/sandbox/win/src/service_resolver_32.cc
 +++ b/sandbox/win/src/service_resolver_32.cc
 @@ -13,22 +13,54 @@
@@ -694,15 +879,19 @@ index 7f6bf39c6e17b..0c84a6c0af207 100644
    SIZE_T read;
    if (!::ReadProcessMemory(process_, target_, &function_code,
                             sizeof(function_code), &read)) {
-@@ -309,18 +391,98 @@ bool ServiceResolverThunk::SaveOriginalFunction(void* local_thunk,
-   return true;
+@@ -312,7 +394,7 @@ bool ServiceResolverThunk::SaveOriginalFunction(void* local_thunk,
+ bool ServiceResolverThunk::VerifyJumpTargetForTesting(
+     void* thunk_storage) const {
+   const size_t kJmp32Size = 5;
+-  ServiceEntryWow64* patched = static_cast<ServiceEntryWow64*>(target_);
++  ServiceEntry* patched = static_cast<ServiceEntry*>(target_);
+   if (kJmp32 != patched->mov_eax) {
+     return false;
+   }
+@@ -323,4 +405,98 @@ bool ServiceResolverThunk::VerifyJumpTargetForTesting(
+          patched->service_id;
  }
  
--bool ServiceResolverThunk::VerifyJumpTargetForTesting(
--    void* thunk_storage) const {
--  const size_t kJmp32Size = 5;
--  ServiceEntryWow64* patched = static_cast<ServiceEntryWow64*>(target_);
--  if (kJmp32 != patched->mov_eax) {
 +bool Wow64ResolverThunk::IsFunctionAService(void* local_thunk) const {
 +  Wow64Entry function_code;
 +  SIZE_T read;
@@ -767,19 +956,15 @@ index 7f6bf39c6e17b..0c84a6c0af207 100644
 +      function_code.call_offset != 3 || kRet != function_code.ret_p ||
 +      kMovEdxEsp != function_code.mov_edx_esp ||
 +      kSysenter != function_code.sysenter || kRet2 != function_code.ret) {
-     return false;
-   }
- 
--  ULONG source_addr = reinterpret_cast<ULONG>(target_);
--  ULONG target_addr = reinterpret_cast<ULONG>(thunk_storage);
--  return target_addr + kMaxServiceSize - kJmp32Size - source_addr ==
--         patched->service_id;
++    return false;
++  }
++
 +  // Save the verified code
 +  memcpy(local_thunk, &function_code, sizeof(function_code));
 +
 +  return true;
- }
- 
++}
++
 +bool Wow64W10ResolverThunk::IsFunctionAService(void* local_thunk) const {
 +  Wow64EntryW10 function_code;
 +  SIZE_T read;
@@ -881,5 +1066,4 @@ index 6c6faeef88a57..92939ac5e6096 100644
 +
  // Returns true if the string contains a NUL ('\0') character.
  bool ContainsNulCharacter(std::wstring_view str);
- 
  

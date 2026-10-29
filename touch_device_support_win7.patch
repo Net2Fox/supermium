@@ -1,5 +1,5 @@
 diff --git a/base/win/win_util.cc b/base/win/win_util.cc
-index 1933efeb0db05..f35912d8941c5 100644
+index 1933efeb0db05..d68f8aff08ffe 100644
 --- a/base/win/win_util.cc
 +++ b/base/win/win_util.cc
 @@ -866,6 +866,12 @@ void SetAbortBehaviorForCrashReporting() {
@@ -15,42 +15,60 @@ index 1933efeb0db05..f35912d8941c5 100644
    // Once this is set, it shouldn't be overridden, and it should be the ultimate
    // return value, so that this method returns the same result whether or not
    // reason is NULL.
-@@ -1100,12 +1106,23 @@ std::wstring GetWindowObjectName(HANDLE handle) {
+@@ -1099,18 +1105,34 @@ std::wstring GetWindowObjectName(HANDLE handle) {
+   return object_name;
  }
  
++// The pointer device APIs only exist on Windows 8 and later, so they are
++// looked up at runtime.
  bool GetPointerDevice(HANDLE device, POINTER_DEVICE_INFO& result) {
-+   static const auto get_pointer_devices =
-+       reinterpret_cast<decltype(&::GetPointerDevices)>(
-+           base::win::GetUser32FunctionPointer("GetPointerDevices"));
-+   if (!get_pointer_devices || GetVersion() < Version::WIN8) {
-+     return false;
-+   }
+-  return ::GetPointerDevice(device, &result);
++  static const auto get_pointer_device =
++      reinterpret_cast<decltype(&::GetPointerDevice)>(
++          base::win::GetUser32FunctionPointer("GetPointerDevice"));
++  if (!get_pointer_device || GetVersion() < Version::WIN8) {
++    return false;
++  }
 +
-   return ::GetPointerDevice(device, &result);
++  return get_pointer_device(device, &result);
  }
  
  std::optional<std::vector<POINTER_DEVICE_INFO>> GetPointerDevices() {
--  uint32_t device_count;
--  if (!::GetPointerDevices(&device_count, nullptr)) {
 +  static const auto get_pointer_devices =
 +      reinterpret_cast<decltype(&::GetPointerDevices)>(
 +          base::win::GetUser32FunctionPointer("GetPointerDevices"));
-+   uint32_t device_count;
-+   if (!get_pointer_devices ||
-+       !get_pointer_devices(&device_count, nullptr) || GetVersion() < Version::WIN8) {
++  if (!get_pointer_devices || GetVersion() < Version::WIN8) {
++    return std::nullopt;
++  }
++
+   uint32_t device_count;
+-  if (!::GetPointerDevices(&device_count, nullptr)) {
++  if (!get_pointer_devices(&device_count, nullptr)) {
      return std::nullopt;
    }
  
-@@ -1118,6 +1135,9 @@ std::optional<std::vector<POINTER_DEVICE_INFO>> GetPointerDevices() {
+   std::vector<POINTER_DEVICE_INFO> pointer_devices(device_count);
+-  if (!::GetPointerDevices(&device_count, pointer_devices.data())) {
++  if (!get_pointer_devices(&device_count, pointer_devices.data())) {
+     return std::nullopt;
+   }
+   return pointer_devices;
+@@ -1118,7 +1140,14 @@ std::optional<std::vector<POINTER_DEVICE_INFO>> GetPointerDevices() {
  
  bool RegisterPointerDeviceNotifications(HWND hwnd,
                                          bool notify_proximity_changes) {
-+   if (!base::win::GetUser32FunctionPointer("RegisterPointerDeviceNotifications") || GetVersion() < Version::WIN8) {
-+     return true;
-+   }
-   return ::RegisterPointerDeviceNotifications(hwnd, notify_proximity_changes);
+-  return ::RegisterPointerDeviceNotifications(hwnd, notify_proximity_changes);
++  static const auto register_pointer_device_notifications =
++      reinterpret_cast<decltype(&::RegisterPointerDeviceNotifications)>(
++          base::win::GetUser32FunctionPointer(
++              "RegisterPointerDeviceNotifications"));
++  if (!register_pointer_device_notifications || GetVersion() < Version::WIN8) {
++    return true;
++  }
++  return register_pointer_device_notifications(hwnd, notify_proximity_changes);
  }
  
+ bool IsRunningUnderDesktopName(std::wstring_view desktop_name) {
 diff --git a/content/browser/renderer_host/legacy_render_widget_host_win.cc b/content/browser/renderer_host/legacy_render_widget_host_win.cc
 index f72a7fcc7b1d1..fe9dcafeb96ec 100644
 --- a/content/browser/renderer_host/legacy_render_widget_host_win.cc
@@ -68,10 +86,18 @@ index f72a7fcc7b1d1..fe9dcafeb96ec 100644
    // support MSAA, and this call failing should not stop us from initializing
    // UI Automation support.
 diff --git a/remoting/host/input_injector_win.cc b/remoting/host/input_injector_win.cc
-index afc03acd8dfcd..6ccbdf1fcb7e9 100644
+index afc03acd8dfcd..ca58e9a874f44 100644
 --- a/remoting/host/input_injector_win.cc
 +++ b/remoting/host/input_injector_win.cc
-@@ -494,7 +494,7 @@ std::unique_ptr<InputInjector> InputInjector::Create(
+@@ -23,6 +23,7 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/single_thread_task_runner.h"
++#include "base/win/windows_version.h"
+ #include "remoting/base/util.h"
+ #include "remoting/host/clipboard.h"
+ #include "remoting/host/touch_injector_win.h"
+@@ -494,7 +495,7 @@ std::unique_ptr<InputInjector> InputInjector::Create(
  
  // static
  bool InputInjector::SupportsTouchEvents() {
@@ -81,18 +107,21 @@ index afc03acd8dfcd..6ccbdf1fcb7e9 100644
  
  }  // namespace remoting
 diff --git a/ui/base/ui_base_features.cc b/ui/base/ui_base_features.cc
-index 2e4b8f6cc94bb..0310fdcc8f44c 100644
+index 434225ce92bff..c5e2e8f6cf5c1 100644
 --- a/ui/base/ui_base_features.cc
 +++ b/ui/base/ui_base_features.cc
-@@ -10,6 +10,7 @@
- #include "base/feature_list.h"
+@@ -11,6 +11,10 @@
  #include "base/metrics/field_trial_params.h"
  #include "build/build_config.h"
-+#include "base/win/windows_version.h"
  
++#if BUILDFLAG(IS_WIN)
++#include "base/win/windows_version.h"
++#endif
++
  #if BUILDFLAG(IS_ANDROID)
  #include "base/android/android_info.h"
-@@ -226,6 +227,17 @@ BASE_FEATURE(kLimitScrollDeltaToScrollerSize, base::FEATURE_ENABLED_BY_DEFAULT);
+ #endif
+@@ -223,6 +227,17 @@ BASE_FEATURE(kLimitScrollDeltaToScrollerSize, base::FEATURE_ENABLED_BY_DEFAULT);
  // Enables focus follow follow cursor (sloppyfocus).
  BASE_FEATURE(kFocusFollowsCursor, base::FEATURE_DISABLED_BY_DEFAULT);
  
@@ -111,7 +140,7 @@ index 2e4b8f6cc94bb..0310fdcc8f44c 100644
               base::FEATURE_ENABLED_BY_DEFAULT);
  
 diff --git a/ui/base/ui_base_features.h b/ui/base/ui_base_features.h
-index 2a5603cf012e7..7ff155e5c998c 100644
+index a68a5fbcd74e7..e0aa166637333 100644
 --- a/ui/base/ui_base_features.h
 +++ b/ui/base/ui_base_features.h
 @@ -47,6 +47,12 @@ BASE_DECLARE_FEATURE(kLimitScrollDeltaToScrollerSize);
@@ -125,10 +154,10 @@ index 2a5603cf012e7..7ff155e5c998c 100644
 +
 +
  COMPONENT_EXPORT(UI_BASE_FEATURES)
- BASE_DECLARE_FEATURE(kTSFImeSupport);
- 
+ BASE_DECLARE_FEATURE(kApplyNativeOcclusionToCompositor);
+ COMPONENT_EXPORT(UI_BASE_FEATURES)
 diff --git a/ui/views/win/hwnd_message_handler.cc b/ui/views/win/hwnd_message_handler.cc
-index 2d335155c66ac..d97d3c488a277 100644
+index fd13d6028789d..478b9a92cda10 100644
 --- a/ui/views/win/hwnd_message_handler.cc
 +++ b/ui/views/win/hwnd_message_handler.cc
 @@ -438,7 +438,8 @@ HWNDMessageHandler::HWNDMessageHandler(HWNDMessageHandlerDelegate* delegate,
@@ -293,10 +322,10 @@ index 2d335155c66ac..d97d3c488a277 100644
                                                      WPARAM w_param,
                                                      LPARAM l_param) {
 diff --git a/ui/views/win/hwnd_message_handler.h b/ui/views/win/hwnd_message_handler.h
-index 9bce185252a52..c2479b90df0f6 100644
+index 6ead63f107474..caa4d6fdf5d33 100644
 --- a/ui/views/win/hwnd_message_handler.h
 +++ b/ui/views/win/hwnd_message_handler.h
-@@ -637,6 +637,17 @@ class VIEWS_EXPORT HWNDMessageHandler : public gfx::WindowImpl,
+@@ -635,6 +635,17 @@ class VIEWS_EXPORT HWNDMessageHandler : public gfx::WindowImpl,
    // Updates DWM frame to extend into client area if needed.
    void UpdateDwmFrame();
  
@@ -314,7 +343,7 @@ index 9bce185252a52..c2479b90df0f6 100644
    // Handles WM_NCLBUTTONDOWN and WM_NCMOUSEMOVE messages on the caption.
    // Returns true if the message was handled.
    bool HandleMouseInputForCaption(unsigned int message,
-@@ -731,6 +742,9 @@ class VIEWS_EXPORT HWNDMessageHandler : public gfx::WindowImpl,
+@@ -729,6 +740,9 @@ class VIEWS_EXPORT HWNDMessageHandler : public gfx::WindowImpl,
    // area. We need this so we can correctly show the context menu on mouse-up.
    bool is_right_mouse_pressed_on_caption_;
  
@@ -324,7 +353,7 @@ index 9bce185252a52..c2479b90df0f6 100644
    // ScopedRedrawLock ----------------------------------------------------------
  
    // Represents the number of ScopedRedrawLocks active against this widget.
-@@ -859,6 +873,10 @@ class VIEWS_EXPORT HWNDMessageHandler : public gfx::WindowImpl,
+@@ -857,6 +871,10 @@ class VIEWS_EXPORT HWNDMessageHandler : public gfx::WindowImpl,
    // partially or fully transparent.
    bool is_translucent_ = false;
  

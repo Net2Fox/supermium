@@ -1,8 +1,8 @@
 diff --git a/core/fxge/cfx_font.cpp b/core/fxge/cfx_font.cpp
-index 87dd65f00..060c6893d 100644
+index 87dd65f00..0664cf7bf 100644
 --- a/core/fxge/cfx_font.cpp
 +++ b/core/fxge/cfx_font.cpp
-@@ -218,6 +218,17 @@ void CFX_Font::LoadSubstFace(const ByteString& face_name,
+@@ -218,6 +218,20 @@ void CFX_Font::LoadSubstFace(const ByteString& face_name,
        subst_font_.get());
    if (face_) {
      font_data_ = face_->GetData();
@@ -17,6 +17,9 @@ index 87dd65f00..060c6893d 100644
 +    face_ = CFX_GEModule::Get()->GetFontMgr()->GetBuiltinMapper()->FindSubstFace(
 +      "Tahoma", bTrueType, flags, weight, italic_angle, code_page,
 +      subst_font_.get());
++    if (face_) {
++      font_data_ = face_->GetData();
++    }
    }
  }
  

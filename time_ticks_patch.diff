@@ -1,8 +1,8 @@
 diff --git a/base/time/time_win.cc b/base/time/time_win.cc
-index c6540592a5c18..c7c51e91c2f7d 100644
+index fcdcb8191ab73..91aec433a9094 100644
 --- a/base/time/time_win.cc
 +++ b/base/time/time_win.cc
-@@ -646,11 +646,30 @@ TimeTicks::Clock TimeTicks::GetClock() {
+@@ -756,11 +756,34 @@ TimeTicks::Clock TimeTicks::GetClock() {
  
  namespace subtle {
  LiveTicks LiveTicksNowIgnoringOverride() {
@@ -11,8 +11,12 @@ index c6540592a5c18..c7c51e91c2f7d 100644
 -  // QueryUnbiasedInterruptTimePrecise gets the interrupt time in system time
 -  // units of 100 nanoseconds.
 -  return LiveTicks() + Nanoseconds(unbiased_interrupt_time * 100);
-+  // Ensure that the assignment to |g_qpc_ticks_per_second|, made in
-+  // InitializeNowFunctionPointer(), has happened by this point.
++  // |g_qpc_ticks_per_second| is assigned by InitializeNowFunctionPointer(),
++  // which normally runs on the first call to TimeTicks::Now(). Ensure that the
++  // assignment has happened by this point, since it is divided by below.
++  if (g_qpc_ticks_per_second <= 0) {
++    InitializeNowFunctionPointer();
++  }
 +  LARGE_INTEGER perf_counter_now = {};
 +  // According to the MSDN documentation for QueryPerformanceCounter(), this
 +  // will never fail on systems that run XP or later.

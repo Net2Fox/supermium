@@ -1,8 +1,8 @@
 diff --git a/content/browser/speech/tts_win.cc b/content/browser/speech/tts_win.cc
-index 706554af2dfd3..a19842369d5fb 100644
+index c32c181c145b3..41769a680273a 100644
 --- a/content/browser/speech/tts_win.cc
 +++ b/content/browser/speech/tts_win.cc
-@@ -226,8 +226,18 @@ void TtsPlatformImplBackgroundWorker::Initialize() {
+@@ -255,8 +255,18 @@ void TtsPlatformImplBackgroundWorker::Initialize() {
    bool success = false;
    std::vector<VoiceData> voices;
  
@@ -22,14 +22,20 @@ index 706554af2dfd3..a19842369d5fb 100644
    if (speech_synthesizer_.Get()) {
      ULONGLONG event_mask =
          SPFEI(SPEI_START_INPUT_STREAM) | SPFEI(SPEI_TTS_BOOKMARK) |
-@@ -256,7 +266,10 @@ void TtsPlatformImplBackgroundWorker::ProcessSpeech(
+@@ -284,8 +294,15 @@ void TtsPlatformImplBackgroundWorker::ProcessSpeech(
+     const UtteranceContinuousParameters& params,
      base::OnceCallback<void(bool)> on_speak_finished,
      const std::string& parsed_utterance) {
-   DCHECK(speech_synthesizer_.Get());
+-  DCHECK(speech_synthesizer_.Get());
 -
 +  // Initialization is not done right away in some cases on XP/2003 x64.
 +  if (!speech_synthesizer_) {
 +    Initialize();
++  }
++  if (!speech_synthesizer_) {
++    GetUIThreadTaskRunner({})->PostTask(
++        FROM_HERE, base::BindOnce(std::move(on_speak_finished), false));
++    return;
 +  }
    SetVoiceFromName(voice.name);
  

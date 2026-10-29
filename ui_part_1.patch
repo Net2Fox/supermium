@@ -1,5 +1,5 @@
 diff --git a/base/feature_list.cc b/base/feature_list.cc
-index 43797ef945756..f7b0c53c1db3b 100644
+index 43797ef945756..8f6313c8fa634 100644
 --- a/base/feature_list.cc
 +++ b/base/feature_list.cc
 @@ -39,6 +39,11 @@
@@ -14,11 +14,12 @@ index 43797ef945756..f7b0c53c1db3b 100644
  namespace base {
  
  namespace {
-@@ -845,6 +850,9 @@ void FeatureList::FinalizeInitialization() {
+@@ -845,6 +850,10 @@ void FeatureList::FinalizeInitialization() {
  bool FeatureList::IsFeatureEnabled(const Feature& feature) const {
    OverrideState overridden_state = GetOverrideState(feature);
  
-+  if(!strcmp(feature.name, "WebContentsForceDark") && 
++  if(!strcmp(feature.name, "WebContentsForceDark") &&
++     base::CommandLine::InitializedForCurrentProcess() &&
 +     base::CommandLine::ForCurrentProcess()->HasSwitch("dark-mode-settings"))
 +    return true;
    // If marked as OVERRIDE_USE_DEFAULT, simply return the default state below.
@@ -156,7 +157,7 @@ index f8363d5b294fe..609f6ebf8dbcd 100644
  MAC_CREATOR_CODE=Cr24
  MAC_TEAM_ID=
 diff --git a/chrome/browser/themes/theme_helper.cc b/chrome/browser/themes/theme_helper.cc
-index 2607ad2493d8f..2c23bf499257d 100644
+index 2607ad2493d8f..e1725437145e9 100644
 --- a/chrome/browser/themes/theme_helper.cc
 +++ b/chrome/browser/themes/theme_helper.cc
 @@ -3,6 +3,7 @@
@@ -167,7 +168,7 @@ index 2607ad2493d8f..2c23bf499257d 100644
  #include "base/no_destructor.h"
  #include "build/build_config.h"
  #include "chrome/browser/themes/browser_theme_pack.h"
-@@ -117,6 +118,31 @@ base::RefCountedMemory* ThemeHelper::GetRawData(
+@@ -117,6 +118,55 @@ base::RefCountedMemory* ThemeHelper::GetRawData(
    return data;
  }
  
@@ -196,9 +197,43 @@ index 2607ad2493d8f..2c23bf499257d 100644
 +  }
 +}
 +
++// static
++bool ThemeHelper::ShouldIgnoreThemeSupplier(
++    int id,
++    bool incognito,
++    const CustomThemeSupplier* theme_supplier) {
++  if (incognito && base::FeatureList::IsEnabled(
++                       base::features::kIncognitoBrandConsistencyForDesktop)) {
++    return true;
++  }
++  // The incognito NTP uses the default background color instead of any theme
++  // background color, unless the theme also sets a custom background image.
++  return incognito && (id == TP::COLOR_NTP_BACKGROUND) &&
++         !HasCustomImage(IDR_THEME_NTP_BACKGROUND, theme_supplier);
++}
++
++// static
++bool ThemeHelper::UseIncognitoColor(int id,
++                                    const CustomThemeSupplier* theme_supplier) {
++  // Incognito is disabled for any non-ignored custom theme colors so they apply
++  // atop a predictable state.
++  return ShouldIgnoreThemeSupplier(id, true, theme_supplier) ||
++         (!IsCustomTheme(theme_supplier) && !theme_supplier);
++}
++
  color_utils::HSL ThemeHelper::GetTint(
      int id,
      bool incognito,
+@@ -127,7 +177,8 @@ color_utils::HSL ThemeHelper::GetTint(
+     return hsl;
+   }
+ 
+-  return TP::GetDefaultTint(id, incognito, UseDarkModeColors(theme_supplier));
++  return TP::GetDefaultTint(id, incognito && UseIncognitoColor(id, theme_supplier),
++                            UseDarkModeColors(theme_supplier));
+ }
+ 
+ gfx::ImageSkia* ThemeHelper::GetImageSkiaNamed(
 diff --git a/chrome/browser/themes/theme_helper.h b/chrome/browser/themes/theme_helper.h
 index 095e3d1c69a43..628fa729b5c63 100644
 --- a/chrome/browser/themes/theme_helper.h
@@ -301,10 +336,10 @@ index 097539947b493..c62502289a0ce 100644
  
  // ThemeService ---------------------------------------------------------------
 diff --git a/chrome/browser/ui/color/chrome_color_mixers.cc b/chrome/browser/ui/color/chrome_color_mixers.cc
-index 9dfe5e7cd531d..1ac8e9dc404c1 100644
+index 9dfe5e7cd531d..cefa88a141ed4 100644
 --- a/chrome/browser/ui/color/chrome_color_mixers.cc
 +++ b/chrome/browser/ui/color/chrome_color_mixers.cc
-@@ -8,8 +8,10 @@
+@@ -8,8 +8,11 @@
  #include <string_view>
  
  #include "base/containers/fixed_flat_map.h"
@@ -312,10 +347,11 @@ index 9dfe5e7cd531d..1ac8e9dc404c1 100644
  #include "base/functional/bind.h"
  #include "base/no_destructor.h"
 +#include "base/path_service.h"
++#include "base/strings/string_number_conversions.h"
  #include "chrome/browser/ui/color/chrome_color_id.h"
  #include "chrome/browser/ui/color/chrome_color_mixer.h"
  #include "chrome/browser/ui/color/material_chrome_color_mixer.h"
-@@ -23,7 +25,11 @@
+@@ -23,7 +26,11 @@
  #include "chrome/browser/ui/color/product_specifications_color_mixer.h"
  #include "chrome/browser/ui/color/projects_panel_color_mixer.h"
  #include "chrome/browser/ui/color/tab_strip_color_mixer.h"
@@ -327,7 +363,7 @@ index 9dfe5e7cd531d..1ac8e9dc404c1 100644
  
  namespace {
  
-@@ -54,6 +60,81 @@ bool ChromeColorProviderUtilsCallbacks::ColorIdName(
+@@ -54,6 +61,80 @@ bool ChromeColorProviderUtilsCallbacks::ColorIdName(
  
  }  // namespace
  
@@ -344,12 +380,9 @@ index 9dfe5e7cd531d..1ac8e9dc404c1 100644
 +	if(!base::PathService::Get(chrome::DIR_USER_DATA, &userdir))
 +		return; // Things are seriously wrong if the user data directory cannot be located.
 +	const base::FilePath userpath = userdir.Append(FILE_PATH_LITERAL("scs"));
-+	std::optional<int64_t> file_size = base::GetFileSize(userpath);
-+	if(!file_size.has_value())
++	std::string bufstr;
++	if(!base::ReadFileToString(userpath, &bufstr))
 +		return;
-+	std::vector<char> buf(file_size.value());
-+	base::ReadFile(userpath, reinterpret_cast<char*>(buf.data()), file_size.value());
-+	std::string bufstr = std::string(reinterpret_cast<char*>(buf.data()));
 +
 +	std::string::size_type sectionstart = bufstr.find("colour");
 +	std::string::size_type sectionend = bufstr.find("endcolour");
@@ -374,22 +407,24 @@ index 9dfe5e7cd531d..1ac8e9dc404c1 100644
 +        if (equalPos != std::string::npos) {
 +            DataItem dataItem;
 +			std::string strkey = dataItemStr.substr(0, equalPos);
-+			if(!std::all_of(strkey.begin(), strkey.end(), [](char c) {return c >= '0' && c <= '9';}))
++			if(strkey.empty() || !std::all_of(strkey.begin(), strkey.end(), [](char c) {return c >= '0' && c <= '9';}))
 +			    break;
-+            dataItem.datakey = std::stoi(strkey);
++            if(!base::StringToInt(strkey, &dataItem.datakey))
++                break;
 +            std::string valuesStr = dataItemStr.substr(equalPos + 1);
 +
 +            // Parse the values
 +            std::istringstream valuesStream(valuesStr);
 +            std::string value;
 +            while (std::getline(valuesStream, value, ',')) {
-+				if(!std::all_of(value.begin(), value.end(), [](char c) {return c >= '0' && c <= '9';}))
++				if(value.empty() || !std::all_of(value.begin(), value.end(), [](char c) {return c >= '0' && c <= '9';}))
 +					break; // No exceptions, so we must verify that there are only integers in the value before continuing.
 +				           // If not, the config file is considered to be "compromised" and needs to be replaced or fixed.
 +						   // We will not tolerate any unexpected values in the data.
 +				if(value.size() > 3)
 +					break; // Any "unnecessarily large" numbers will also be blocked.
-+				int val = std::stoi(value);
++				int val = 0;
++				base::StringToInt(value, &val);
 +				if(val > 255)
 +					break;
 +                dataItem.values.push_back(val);
@@ -438,53 +473,17 @@ index 2dcd8cfb651f0..3bb8cc3725ef9 100644
           base::FeatureList::IsEnabled(kWindows11MicaTitlebar);
  }
 diff --git a/chrome/browser/win/titlebar_config.cc b/chrome/browser/win/titlebar_config.cc
-index 7898ea88ca529..41cc07e9c32d5 100644
+index 7898ea88ca529..b263102e1565e 100644
 --- a/chrome/browser/win/titlebar_config.cc
 +++ b/chrome/browser/win/titlebar_config.cc
-@@ -4,14 +4,51 @@
- 
- #include "chrome/browser/win/titlebar_config.h"
- 
-+#include <Windows.h>
-+#include "base/command_line.h"
-+#include "base/win/windows_version.h"
- #include "chrome/browser/themes/theme_service.h"
- #include "chrome/browser/themes/theme_service_factory.h"
+@@ -9,9 +9,15 @@
  #include "chrome/browser/ui/browser.h"
  #include "chrome/browser/ui/views/frame/browser_view.h"
  #include "chrome/browser/win/mica_titlebar.h"
-+#include "chrome/common/chrome_switches.h"
++#include "ui/base/win/shell.h"
 +
 +bool ShouldCustomDrawSystemTitlebar() {
-+  // Some extra code added here because those with pre-win8 and no DWM will have to fallback on the custom titlebar.
-+  BOOL result = FALSE;
-+
-+  typedef HRESULT(WINAPI* DwmIsCompositionEnabledFunc)(BOOL* enabled);
-+  DwmIsCompositionEnabledFunc func_ = nullptr;
-+
-+  HMODULE dwmapi_library_ = LoadLibraryW(L"dwmapi.dll");
-+  if (dwmapi_library_) {
-+    func_ = reinterpret_cast<DwmIsCompositionEnabledFunc>(
-+        GetProcAddress(dwmapi_library_, "DwmIsCompositionEnabled"));
-+  }
-+  else
-+	  return true;
-+ 
-+  if (func_) {
-+	  func_(&result);
-+  }
-+  else
-+	  return true;
-+  // Cache flag lookup.
-+  static const bool custom_titlebar_disabled =
-+      base::CommandLine::InitializedForCurrentProcess() &&
-+      (base::CommandLine::ForCurrentProcess()->HasSwitch(
-+          "disable-windows10-custom-titlebar") ||
-+	  base::CommandLine::ForCurrentProcess()->HasSwitch(
-+          "windows11-mica-titlebar"));
-+
-+  return (!custom_titlebar_disabled &&
-+         base::win::GetVersion() >= base::win::Version::WIN10) || !result;
++  return ui::win::ShouldCustomDrawSystemTitlebar();
 +}
  
  bool ShouldBrowserCustomDrawTitlebar(BrowserView* browser_view) {
@@ -607,24 +606,24 @@ index 283ea725c5a18..11b3e4e466a95 100755
                  'namespace': 'Chromium.Policies.Chromium',
              },
 diff --git a/ui/views/win/hwnd_message_handler.cc b/ui/views/win/hwnd_message_handler.cc
-index 8d7b890d4822a..35e638487a01b 100644
+index 8d7b890d4822a..fd13d6028789d 100644
 --- a/ui/views/win/hwnd_message_handler.cc
 +++ b/ui/views/win/hwnd_message_handler.cc
-@@ -37,6 +37,7 @@
- #include "base/win/scoped_gdi_object.h"
- #include "base/win/win_util.h"
- #include "base/win/windows_version.h"
-+#include "chrome/browser/win/titlebar_config.h"
- #include "services/tracing/public/cpp/perfetto/macros.h"
- #include "third_party/perfetto/protos/perfetto/trace/track_event/chrome_window_handle_event_info.pbzero.h"
- #include "third_party/skia/include/core/SkPath.h"
+@@ -55,6 +55,7 @@
+ #include "ui/base/win/lock_state.h"
+ #include "ui/base/win/mouse_wheel_util.h"
+ #include "ui/base/win/session_change_observer.h"
++#include "ui/base/win/shell.h"
+ #include "ui/base/win/touch_input.h"
+ #include "ui/base/win/win_cursor.h"
+ #include "ui/display/screen.h"
 @@ -359,7 +360,8 @@ class HWNDMessageHandler::ScopedRedrawLock {
          hwnd_(owner_->hwnd()),
          should_lock_(owner_->IsVisible() && !owner->HasChildRenderingWindow() &&
                       ::IsWindow(hwnd_) && !owner_->IsHeadless() &&
 -                     (!(::GetWindowLong(hwnd_, GWL_STYLE) & WS_CAPTION))) {
 +                     (!(GetWindowLong(hwnd_, GWL_STYLE) & WS_CAPTION) ||
-+					  ShouldCustomDrawSystemTitlebar())) {
++					  ui::win::ShouldCustomDrawSystemTitlebar())) {
      if (should_lock_) {
        owner_->LockUpdates();
      }
@@ -633,7 +632,7 @@ index 8d7b890d4822a..35e638487a01b 100644
  
  void HWNDMessageHandler::SetDwmFrameExtension(DwmFrameState state) {
 -  if (!delegate_->HasFrame() && !is_translucent_) {
-+  if (!delegate_->HasFrame() && !ShouldCustomDrawSystemTitlebar() &&
++  if (!delegate_->HasFrame() && !ui::win::ShouldCustomDrawSystemTitlebar() &&
 +	  !is_translucent_) {
      gfx::Insets insets;
      if (state == DwmFrameState::kOn && !IsMaximized()) {
@@ -652,7 +651,7 @@ index 8d7b890d4822a..35e638487a01b 100644
  LRESULT HWNDMessageHandler::OnEraseBkgnd(HDC dc) {
    gfx::Insets insets;
 -  if (delegate_->GetDwmFrameInsetsInPixels(&insets) && !insets.IsEmpty() &&
-+  if (!ShouldCustomDrawSystemTitlebar() &&
++  if (!ui::win::ShouldCustomDrawSystemTitlebar() &&
 +	  delegate_->GetDwmFrameInsetsInPixels(&insets) && !insets.IsEmpty() &&
        needs_dwm_frame_clear_) {
      // This is necessary to avoid white flashing in the titlebar area around the
@@ -661,7 +660,7 @@ index 8d7b890d4822a..35e638487a01b 100644
    // It's required to avoid some native painting artifacts from appearing when
    // the window is resized.
    if (!delegate_->HasNonClientView() || IsFrameSystemDrawn()) {
-+    if (!ShouldCustomDrawSystemTitlebar()) {
++    if (!ui::win::ShouldCustomDrawSystemTitlebar()) {
      // The default WM_NCPAINT handler under Aero Glass doesn't clear the
      // nonclient area, so it'll remain the default white color. That area is
      // invisible initially (covered by the window border) but can become
@@ -700,8 +699,79 @@ index 8d7b890d4822a..35e638487a01b 100644
  
    gfx::Insets insets;
 -  if (delegate_->GetDwmFrameInsetsInPixels(&insets)) {
-+  if (!ShouldCustomDrawSystemTitlebar() &&
++  if (!ui::win::ShouldCustomDrawSystemTitlebar() &&
 +      delegate_->GetDwmFrameInsetsInPixels(&insets)) {
      // Avoid redundant cross-process DWM calls when the margins haven't changed.
      if (last_dwm_frame_insets_ == insets) {
        return;
+diff --git a/ui/base/win/shell.cc b/ui/base/win/shell.cc
+index ac53b1bed6e8c..ddd1116e683db 100644
+--- a/ui/base/win/shell.cc
++++ b/ui/base/win/shell.cc
+@@ -13,6 +13,7 @@
+ #include <shellapi.h>
+ #include <wrl/client.h>
+ 
++#include "base/command_line.h"
+ #include "base/debug/alias.h"
+ #include "base/feature_list.h"
+ #include "base/files/file.h"
+@@ -26,6 +27,7 @@
+ #include "base/win/scoped_co_mem.h"
+ #include "base/win/shell_util.h"
+ #include "base/win/win_util.h"
++#include "base/win/windows_version.h"
+ #include "ui/base/ui_base_switches.h"
+ 
+ namespace ui::win {
+@@ -265,4 +267,34 @@ void ClearWindowPropertyStore(HWND hwnd) {
+   DCHECK(FAILED(pps->GetCount(&property_count)) || property_count == 0);
+ }
+ 
++bool ShouldCustomDrawSystemTitlebar() {
++  // dwmapi.dll doesn't exist on Windows XP, so it is loaded dynamically.
++  using DwmIsCompositionEnabledFunc = HRESULT(WINAPI*)(BOOL*);
++  static const DwmIsCompositionEnabledFunc dwm_is_composition_enabled = [] {
++    HMODULE dwmapi = ::LoadLibraryW(L"dwmapi.dll");
++    return dwmapi ? reinterpret_cast<DwmIsCompositionEnabledFunc>(
++                        ::GetProcAddress(dwmapi, "DwmIsCompositionEnabled"))
++                  : nullptr;
++  }();
++  // Without desktop composition the system titlebar can't be used, so fall back
++  // on the custom one. Composition can be toggled at runtime before Windows 8,
++  // so this is checked every time.
++  BOOL composition_enabled = FALSE;
++  if (!dwm_is_composition_enabled ||
++      FAILED(dwm_is_composition_enabled(&composition_enabled)) ||
++      !composition_enabled) {
++    return true;
++  }
++
++  // Cache flag lookup.
++  static const bool custom_titlebar_disabled =
++      base::CommandLine::InitializedForCurrentProcess() &&
++      (base::CommandLine::ForCurrentProcess()->HasSwitch(
++           "disable-windows10-custom-titlebar") ||
++       base::CommandLine::ForCurrentProcess()->HasSwitch(
++           "windows11-mica-titlebar"));
++  return !custom_titlebar_disabled &&
++         base::win::GetVersion() >= base::win::Version::WIN10;
++}
++
+ }  // namespace ui::win
+diff --git a/ui/base/win/shell.h b/ui/base/win/shell.h
+index 0de77a7410f14..806b84e301360 100644
+--- a/ui/base/win/shell.h
++++ b/ui/base/win/shell.h
+@@ -78,6 +78,11 @@ void SetRelaunchDetailsForWindow(const std::wstring& relaunch_command,
+ // Clears the Window Property Store on an HWND.
+ COMPONENT_EXPORT(UI_BASE) void ClearWindowPropertyStore(HWND hwnd);
+ 
++// Returns whether the system titlebar should always be custom drawn: on
++// Windows 10 and later (unless disabled from the command line), and whenever
++// desktop composition is unavailable, as on Windows XP or with Aero disabled.
++COMPONENT_EXPORT(UI_BASE) bool ShouldCustomDrawSystemTitlebar();
++
+ }  // namespace ui::win
+ 
+ #endif  // UI_BASE_WIN_SHELL_H_

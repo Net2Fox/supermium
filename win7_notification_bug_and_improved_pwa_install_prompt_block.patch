@@ -49,7 +49,7 @@ index aa3427c786f00..9935df662205f 100644
    // Actions that do not directly show up in chrome UI.
    root_action_item_->AddChild(
 diff --git a/ui/base/win/lock_state.cc b/ui/base/win/lock_state.cc
-index 563d6b09c1044..fc2904a78f9b5 100644
+index 563d6b09c1044..80c23916c1cd0 100644
 --- a/ui/base/win/lock_state.cc
 +++ b/ui/base/win/lock_state.cc
 @@ -8,6 +8,7 @@
@@ -64,8 +64,8 @@ index 563d6b09c1044..fc2904a78f9b5 100644
  
    absl::Cleanup wts_deleter = [buffer] { ::WTSFreeMemory(buffer); };
    auto* info = reinterpret_cast<WTSINFOEXW*>(buffer);
-+  // Lock and unlock are reversed on Windows 7.
-+  if (base::win::GetVersion() >= base::win::Version::WIN7)
++  // Lock and unlock are reversed on Windows 7 (and Server 2008 R2) only.
++  if (base::win::GetVersion() == base::win::Version::WIN7)
 +    return info->Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_UNLOCK;
    return info->Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_LOCK;
  }

@@ -1,24 +1,45 @@
 diff --git a/net/quic/quic_session_pool.cc b/net/quic/quic_session_pool.cc
-index 3e0cca96db01f..8964322543be6 100644
+index 3e0cca96db01f..52168a83df67c 100644
 --- a/net/quic/quic_session_pool.cc
 +++ b/net/quic/quic_session_pool.cc
-@@ -1998,8 +1998,19 @@ void QuicSessionPool::FinishCreateSession(
-     int rv) {
-   if (rv != OK) {
-     CHECK_NE(rv, ERR_IO_PENDING);
+@@ -94,6 +94,10 @@
+ #include "url/scheme_host_port.h"
+ #include "url/url_constants.h"
+ 
 +#if BUILDFLAG(IS_WIN)
-+    // Windows 7 and below have rv set to ERR_FAILED. Set it to 0 and QUIC works.
-+    if (rv == ERR_FAILED) {
-+      rv = 0;
-+    } else {
-+      std::move(callback).Run(base::unexpected(rv));
-+      return;
-+    }
-+#else
-+    CHECK_NE(rv, ERR_IO_PENDING);
-     std::move(callback).Run(base::unexpected(rv));
-     return;
++#include "base/win/windows_version.h"
 +#endif
++
+ #if BUILDFLAG(IS_ANDROID)
+ #include "base/android/application_status_listener.h"
+ #include "base/android/pre_freeze_background_memory_trimmer.h"
+@@ -1222,6 +1226,14 @@ void QuicSessionPool::FinishConnectAndConfigureSocket(
    }
-   base::expected<QuicSessionAttempt::CreateSessionResult, int> result =
-       CreateSessionHelper(
+ 
+   rv = socket->SetRecvTos();
++#if BUILDFLAG(IS_WIN)
++  // Receiving ECN marks needs IP_RECVECN, which Windows only supports since
++  // Windows 10. It is optional, so carry on without it on older versions
++  // instead of failing every QUIC connection there.
++  if (rv != OK && base::win::GetVersion() < base::win::Version::WIN10) {
++    rv = OK;
++  }
++#endif
+   if (rv != OK) {
+     OnFinishConnectAndConfigureSocketError(
+         std::move(callback), CREATION_ERROR_SETTING_RECEIVE_ECN, rv);
+@@ -1335,6 +1347,14 @@ int QuicSessionPool::ConfigureSocket(DatagramClientSocket* socket,
+   }
+ 
+   rv = socket->SetRecvTos();
++#if BUILDFLAG(IS_WIN)
++  // Receiving ECN marks needs IP_RECVECN, which Windows only supports since
++  // Windows 10. It is optional, so carry on without it on older versions
++  // instead of failing every QUIC connection there.
++  if (rv != OK && base::win::GetVersion() < base::win::Version::WIN10) {
++    rv = OK;
++  }
++#endif
+   if (rv != OK) {
+     HistogramCreateSessionFailure(CREATION_ERROR_SETTING_RECEIVE_ECN);
+     return rv;

@@ -111,7 +111,7 @@ index b4ecce05e616d..28a6c7fb1265f 100644
        // https://chromestatus.com/feature/5153932394102784
        // Shipping in M150, so flag can be removed around M152.
 diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedder_support/user_agent_utils.cc
-index 608bea5cb3864..f933adec2e23d 100644
+index 608bea5cb3864..41d34a28c8298 100644
 --- a/components/embedder_support/user_agent_utils.cc
 +++ b/components/embedder_support/user_agent_utils.cc
 @@ -16,8 +16,11 @@
@@ -130,11 +130,11 @@ index 608bea5cb3864..f933adec2e23d 100644
  #include "base/version.h"
  #include "build/branding_buildflags.h"
  #include "build/build_config.h"
-+#include "chrome/common/chrome_paths.h"
++#include "chrome/common/chrome_paths.h"  // nogncheck
  #include "components/embedder_support/pref_names.h"
  #include "components/embedder_support/switches.h"
  #include "components/policy/core/common/policy_pref_names.h"
-@@ -58,6 +62,59 @@ namespace embedder_support {
+@@ -58,6 +62,76 @@ namespace embedder_support {
  
  namespace {
  
@@ -167,26 +167,43 @@ index 608bea5cb3864..f933adec2e23d 100644
 +    return tokens;
 +}
 +
-+// Function to parse the file
-+std::string parseFile(UACHSpoofType SpoofTarget) {
++// Reads the fields of the user-defined "uao" file, which are separated by
++// ";;;". Returns no fields if there is no such file.
++std::vector<std::string> ReadUaoFields() {
 +    base::FilePath userdir;
 +    if(!base::PathService::Get(chrome::DIR_USER_DATA, &userdir)) {
-+        return std::string(); // Things are seriously wrong if the user data directory cannot be located.
++        return {}; // Things are seriously wrong if the user data directory cannot be located.
 +	}
 +    const base::FilePath userpath = userdir.Append(FILE_PATH_LITERAL("uao"));
-+    std::optional<int64_t> file_size = base::GetFileSize(userpath);
-+    if(!file_size.has_value()) {
-+        return std::string();
-+	}
-+    std::vector<char> buf(file_size.value());
-+    base::ReadFile(userpath, reinterpret_cast<char*>(buf.data()), file_size.value());
-+    std::string bufstr = std::string(reinterpret_cast<char*>(buf.data()));
++    std::string bufstr;
++    if (!base::ReadFileToString(userpath, &bufstr)) {
++        return {};
++    }
++    return split(bufstr, ";;;");
++}
 +
-+    std::vector<std::string> fields = split(bufstr, ";;;");
++// Function to parse the file
++std::string parseFile(UACHSpoofType SpoofTarget) {
++    // This is consulted for every user agent string, so the file is only read
++    // once, unless "live" customization was requested (as for the layout
++    // constants).
++    std::vector<std::string> fields;
++    if (base::CommandLine::InitializedForCurrentProcess() &&
++        base::CommandLine::ForCurrentProcess()->HasSwitch(
++            "enable-advanced-customization")) {
++        fields = ReadUaoFields();
++    } else {
++        static const base::NoDestructor<std::vector<std::string>> cached_fields(
++            ReadUaoFields());
++        fields = *cached_fields;
++    }
++    if (fields.empty()) {
++       return std::string();
++    }
 +    if (fields.size() > SpoofTarget) {
 +	   return fields[SpoofTarget];
 +    } else {
-+       LOG(0) << "UAO file invalid; all fields are not present";
++       LOG(WARNING) << "UAO file invalid; all fields are not present";
 +       return std::string();
 +    }
 +}
@@ -194,7 +211,7 @@ index 608bea5cb3864..f933adec2e23d 100644
  #if BUILDFLAG(IS_WIN)
  
  // The registry key where the UniversalApiContract version value can be read
-@@ -78,7 +135,7 @@ constexpr wchar_t kUniversalApiContractName[] =
+@@ -78,7 +152,7 @@ constexpr wchar_t kUniversalApiContractName[] =
  // to rely on querying the IsApiContractPresentByMajor function used by
  // user_agent_utils_unittest.cc.
  const int kHighestKnownUniversalApiContractVersion = 19;
@@ -203,7 +220,7 @@ index 608bea5cb3864..f933adec2e23d 100644
  int GetPreRS5UniversalApiContractVersion() {
    // This calls Kernel32Version() to get the real non-spoofable version (as
    // opposed to base::win::GetVersion() which as of writing this seems to return
-@@ -107,7 +164,7 @@ int GetPreRS5UniversalApiContractVersion() {
+@@ -107,7 +181,7 @@ int GetPreRS5UniversalApiContractVersion() {
    // RS5.
    NOTREACHED();
  }
@@ -212,7 +229,7 @@ index 608bea5cb3864..f933adec2e23d 100644
  // Returns the UniversalApiContract version number, which is available for
  // Windows versions greater than RS5. Otherwise, returns 0.
  const std::string& GetUniversalApiContractVersion() {
-@@ -122,7 +179,7 @@ const std::string& GetUniversalApiContractVersion() {
+@@ -122,7 +196,7 @@ const std::string& GetUniversalApiContractVersion() {
          int minor_version = 0;
          if (base::win::OSInfo::Kernel32Version() <=
              base::win::Version::WIN10_RS4) {
@@ -221,7 +238,7 @@ index 608bea5cb3864..f933adec2e23d 100644
          } else {
            base::win::RegKey version_key(
                HKEY_LOCAL_MACHINE, kWindowsRuntimeWellKnownContractsRegKeyName,
-@@ -163,15 +220,27 @@ const blink::UserAgentBrandList GetUserAgentBrandList(
+@@ -163,15 +237,27 @@ const blink::UserAgentBrandList GetUserAgentBrandList(
    bool parse_result = base::StringToInt(major_version, &major_version_number);
    DCHECK(parse_result);
    std::optional<std::string> brand;
@@ -249,7 +266,7 @@ index 608bea5cb3864..f933adec2e23d 100644
    return GenerateBrandVersionList(major_version_number, brand, brand_version,
                                    output_version_type,
                                    additional_brand_version);
-@@ -468,6 +537,11 @@ std::string GetUserAgent() {
+@@ -468,6 +554,11 @@ std::string GetUserAgent() {
      return custom_ua.value();
    }
  
@@ -261,4 +278,21 @@ index 608bea5cb3864..f933adec2e23d 100644
    return GetUserAgentInternal();
  }
  
+diff --git a/components/embedder_support/BUILD.gn b/components/embedder_support/BUILD.gn
+index 847ba42327e11..bbdf9ebdbbabb 100644
+--- a/components/embedder_support/BUILD.gn
++++ b/components/embedder_support/BUILD.gn
+@@ -65,6 +65,13 @@ static_library("user_agent") {
+     "//third_party/blink/public/common:headers",
+     "//ui/base",
+   ]
++
++  # For the generated headers that chrome/common/chrome_paths.h includes
++  # (see user_agent_utils.cc).
++  deps += [
++    "//extensions/buildflags",
++    "//third_party/widevine/cdm:buildflags",
++  ]
+ }
  
+ source_set("unit_tests") {

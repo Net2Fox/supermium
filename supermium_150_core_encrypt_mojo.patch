@@ -75,35 +75,56 @@ index 45e91f10d8139..5447a79a1fd78 100644
  
  bool AppBoundEncryptionProviderWin::IsCompatibleWithOsCryptSync() {
 diff --git a/components/system_cpu/cpu_probe_win.cc b/components/system_cpu/cpu_probe_win.cc
-index 1a11bf5c4c3e5..85bf43935ed6c 100644
+index 1a11bf5c4c3e5..4dab9cd5206ec 100644
 --- a/components/system_cpu/cpu_probe_win.cc
 +++ b/components/system_cpu/cpu_probe_win.cc
-@@ -92,7 +92,7 @@ std::optional<CpuSample> CpuProbeWin::BlockingTaskRunnerHelper::Update() {
+@@ -29,6 +29,24 @@ constexpr wchar_t kHypervisorLogicalProcessorCounter[] =
+ constexpr wchar_t kProcessorCounter[] =
+     L"\\Processor(_Total)\\% Processor Time";
+ 
++// Supermium: PdhAddEnglishCounter() does not exist on Windows XP, so it is
++// looked up at runtime. The counter paths above are English, and on later
++// versions they must be added with it: PdhAddCounter() expects localized
++// counter names and fails on non-English editions of Windows.
++PDH_STATUS AddEnglishCounter(PDH_HQUERY query,
++                             const wchar_t* counter_path,
++                             PDH_HCOUNTER* counter) {
++  using PdhAddEnglishCounterWFunc =
++      PDH_STATUS(WINAPI*)(PDH_HQUERY, LPCWSTR, DWORD_PTR, PDH_HCOUNTER*);
++  static const auto pdh_add_english_counter =
++      reinterpret_cast<PdhAddEnglishCounterWFunc>(::GetProcAddress(
++          ::GetModuleHandleW(L"pdh.dll"), "PdhAddEnglishCounterW"));
++  if (pdh_add_english_counter) {
++    return pdh_add_english_counter(query, counter_path, 0, counter);
++  }
++  return ::PdhAddCounterW(query, counter_path, 0, counter);
++}
++
+ }  // namespace
+ 
+ // Helper class that performs the actual I/O. It must run on a
+@@ -92,8 +110,8 @@ std::optional<CpuSample> CpuProbeWin::BlockingTaskRunnerHelper::Update() {
      const auto* query_info = is_running_in_vm
                                   ? kHypervisorLogicalProcessorCounter
                                   : kProcessorCounter;
 -    pdh_status = PdhAddEnglishCounter(cpu_query_.get(), query_info, NULL,
-+    pdh_status = PdhAddCounter(cpu_query_.get(), query_info, NULL,
-                                       &cpu_percent_utilization_);
+-                                      &cpu_percent_utilization_);
++    pdh_status = AddEnglishCounter(cpu_query_.get(), query_info,
++                                   &cpu_percent_utilization_);
  
      // When Chrome is running under a different hypervisor, we can add the
-@@ -102,14 +102,14 @@ std::optional<CpuSample> CpuProbeWin::BlockingTaskRunnerHelper::Update() {
+     // Hyper-V performance counter successfully but it isn't available to
+@@ -102,8 +120,8 @@ std::optional<CpuSample> CpuProbeWin::BlockingTaskRunnerHelper::Update() {
        pdh_status = PdhCollectQueryData(cpu_query_.get());
        if (pdh_status != ERROR_SUCCESS) {
          query_info = kProcessorCounter;
 -        pdh_status = PdhAddEnglishCounter(cpu_query_.get(), query_info, NULL,
-+        pdh_status = PdhAddCounter(cpu_query_.get(), query_info, NULL,
-                                           &cpu_percent_utilization_);
+-                                          &cpu_percent_utilization_);
++        pdh_status = AddEnglishCounter(cpu_query_.get(), query_info,
++                                       &cpu_percent_utilization_);
        }
      }
  
-     if (pdh_status != ERROR_SUCCESS) {
-       cpu_query_.reset();
--      LOG(ERROR) << "PdhAddEnglishCounter failed for '" << query_info
-+      LOG(ERROR) << "PdhAddCounter failed for '" << query_info
-                  << "': " << logging::SystemErrorCodeToString(pdh_status);
-       return std::nullopt;
-     }
 diff --git a/components/update_client/background_downloader_win.cc b/components/update_client/background_downloader_win.cc
 index 517cab62f9ba0..2e0f4cf1e540b 100644
 --- a/components/update_client/background_downloader_win.cc
@@ -118,7 +139,7 @@ index 517cab62f9ba0..2e0f4cf1e540b 100644
             base::win::ComApartmentType::MTA);
  }
 diff --git a/crypto/process_bound_string.cc b/crypto/process_bound_string.cc
-index 3d60dd10ba60e..eba4278704734 100644
+index 3d60dd10ba60e..1c836d8db52a9 100644
 --- a/crypto/process_bound_string.cc
 +++ b/crypto/process_bound_string.cc
 @@ -14,6 +14,7 @@
@@ -145,7 +166,7 @@ index 3d60dd10ba60e..eba4278704734 100644
    TRACE_EVENT0(kTraceCategory, "ProcessBoundString::DecryptBuffer");
 -  if (::CryptUnprotectMemory(buffer.data(), buffer.size(),
 +  if (base::win::GetVersion() > base::win::Version::XP &&
-+      ::CryptUnrotectMemory(buffer.data(), buffer.size(),
++      ::CryptUnprotectMemory(buffer.data(), buffer.size(),
                               CRYPTPROTECTMEMORY_SAME_PROCESS)) {
      return true;
    }
@@ -233,5 +254,4 @@ index 2a53e85121870..a3d6cf4f2ba6e 100644
 +  g_mojo_ipcz_enabled.store(kIsIpczSupported, std::memory_order_release);
  #endif
  }
- 
  

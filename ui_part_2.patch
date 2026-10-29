@@ -13,10 +13,10 @@ index f5831f33b9fd1..a745551e9548b 100644
                                          enable_tab_search_commands);
    command_updater_.UpdateCommandEnabled(IDC_TAB_SEARCH_CLOSE,
 diff --git a/chrome/browser/ui/layout_constants.cc b/chrome/browser/ui/layout_constants.cc
-index b2c1709b4c2ac..9f6702af095c6 100644
+index b2c1709b4c2ac..daa15e961e825 100644
 --- a/chrome/browser/ui/layout_constants.cc
 +++ b/chrome/browser/ui/layout_constants.cc
-@@ -4,9 +4,14 @@
+@@ -4,9 +4,15 @@
  
  #include "chrome/browser/ui/layout_constants.h"
  
@@ -25,13 +25,14 @@ index b2c1709b4c2ac..9f6702af095c6 100644
 +#include "base/logging.h"
  #include "base/notreached.h"
 +#include "base/path_service.h"
++#include "base/strings/string_number_conversions.h"
  #include "build/build_config.h"
  #include "chrome/browser/ui/tabs/features.h"
 +#include "chrome/common/chrome_paths.h"
  #include "components/omnibox/common/omnibox_features.h"
  #include "ui/base/pointer/touch_ui_controller.h"
  #include "ui/base/ui_base_features.h"
-@@ -16,160 +21,175 @@
+@@ -16,160 +22,175 @@
  #include "chromeos/constants/chromeos_features.h"
  #endif
  
@@ -41,7 +42,7 @@ index b2c1709b4c2ac..9f6702af095c6 100644
 +#pragma allow_unsafe_buffers
 +#endif
 +
-+int layout_constant_values[(size_t)LayoutConstant::kLast];
++int layout_constant_values[(size_t)LayoutConstant::kLast + 1];
 +
 +void SetTabStripFullscreen() {
 +  if (!layout_constant_values[(int)LayoutConstant::kTabStripPadWhenMaximized])
@@ -357,7 +358,7 @@ index b2c1709b4c2ac..9f6702af095c6 100644
  }
  
  gfx::Insets GetLayoutInsets(LayoutInset inset) {
-@@ -233,3 +253,53 @@ gfx::Insets GetLayoutInsets(LayoutInset inset) {
+@@ -233,3 +254,60 @@ gfx::Insets GetLayoutInsets(LayoutInset inset) {
    }
    NOTREACHED();
  }
@@ -387,33 +388,40 @@ index b2c1709b4c2ac..9f6702af095c6 100644
 +      return;
 +  }
 +
-+  for (int i = 0; i < (int)LayoutConstant::kLast; i++)
++  for (int i = 0; i <= (int)LayoutConstant::kLast; i++)
 +  {
 +      // In scs, each layout "constant" is identified by its index in the LayoutConstant enum.
 +      // This may mean that the index corresponding to a constant may change from version to version, 
 +      // but it does simplify the parsing process.
-+	  std::string layout_name = std::string("int_layout_constant_") + std::string("{");
++	  std::string layout_name = std::string("int_layout_constant_") + base::NumberToString(i) + std::string("{");
 +      std::string::size_type layout_setting_pos = bufstr.find(layout_name, 0);
 +      if (layout_setting_pos == std::string::npos) {
 +          continue;
 +      }
 +      std::string constant_val = bufstr.substr(layout_setting_pos + layout_name.length());
 +	  constant_val = constant_val.substr(0, constant_val.find("}"));
-+      if(!std::all_of(constant_val.begin(), constant_val.end(), [](char c) {return c >= '0' && c <= '9';}))
++      if(constant_val.empty() || !std::all_of(constant_val.begin(), constant_val.end(), [](char c) {return c >= '0' && c <= '9';}))
 +          continue;
-+      layout_constant_values[i] = std::stoi(constant_val);
++      int value = 0;
++      if (!base::StringToInt(constant_val, &value))
++          continue;
++      layout_constant_values[i] = value;
 +  }
 +  layout_constant_values[(int)LayoutConstant::kTabStripHeight] = layout_constant_values[(int)LayoutConstant::kTabHeight] + 
 +                                                            layout_constant_values[(int)LayoutConstant::kTabStripPadding];
 + }
 + 
 +int GetLayoutConstant(LayoutConstant constant) {
++  // The values are filled in on first use, so that callers that run before
++  // the tab strip or the location bar are created don't get zeroes.
++  if (!g_layout_constants_initialized)
++      SetLayoutConstants();
 +  int result = layout_constant_values[(int)constant];
 +  return result;
 + }
 \ No newline at end of file
 diff --git a/chrome/browser/ui/layout_constants.h b/chrome/browser/ui/layout_constants.h
-index 608a5c38e6dd8..b8e3359a31c5c 100644
+index 608a5c38e6dd8..a0be8d5904ef0 100644
 --- a/chrome/browser/ui/layout_constants.h
 +++ b/chrome/browser/ui/layout_constants.h
 @@ -265,7 +265,60 @@ enum class LayoutConstant {
@@ -474,7 +482,7 @@ index 608a5c38e6dd8..b8e3359a31c5c 100644
 +  // y-offset of the tab title.
 +  kTabTitleYOffset,
 +
-+  kLast
++  kLast = kTabTitleYOffset
  };
  
  enum LayoutInset {
@@ -494,7 +502,7 @@ index 608a5c38e6dd8..b8e3359a31c5c 100644
 +
  #endif  // CHROME_BROWSER_UI_LAYOUT_CONSTANTS_H_
 diff --git a/chrome/browser/ui/views/tabs/tab.cc b/chrome/browser/ui/views/tabs/tab.cc
-index f80c98d3bd162..8b6097a7646e2 100644
+index f80c98d3bd162..d5852843ed902 100644
 --- a/chrome/browser/ui/views/tabs/tab.cc
 +++ b/chrome/browser/ui/views/tabs/tab.cc
 @@ -14,6 +14,7 @@
@@ -589,7 +597,7 @@ index f80c98d3bd162..8b6097a7646e2 100644
 -    if (showing_close_button_) {
 +	if (base::CommandLine::ForCurrentProcess()->HasSwitch("hide-tab-close-buttons")) {
 +      showing_close_button_ = false;
-+    } else {
++    } else if (showing_close_button_) {
        available_width -= close_button_width;
 -    }
 +	}
@@ -1015,47 +1023,89 @@ index 44a60df681ef2..3dd5d740914d5 100644
  
  bool TabStyleViewsImpl::IsLeftSplitTab(const Tab* tab) const {
 diff --git a/chrome/browser/ui/webui/webui_toolbar/webui_toolbar_layout_css_helper.cc b/chrome/browser/ui/webui/webui_toolbar/webui_toolbar_layout_css_helper.cc
-index bc7c354550ad4..5b7f8f47dfa5d 100644
+index bc7c354550ad4..776683d506a5b 100644
 --- a/chrome/browser/ui/webui/webui_toolbar/webui_toolbar_layout_css_helper.cc
 +++ b/chrome/browser/ui/webui/webui_toolbar/webui_toolbar_layout_css_helper.cc
-@@ -166,6 +166,8 @@ std::string_view LayoutConstantToCssVarName(LayoutConstant layout_constant) {
+@@ -166,6 +166,40 @@ std::string_view LayoutConstantToCssVarName(LayoutConstant layout_constant) {
        return "--web-app-menu-button-size";
      case kWebAppPageActionIconSize:
        return "--web-app-page-action-icon-size";
-+    default:
-+      break;
++    case kTabWidth:
++      return "--tab-width";
++    case kTabHorizontalPadding:
++      return "--tab-horizontal-padding";
++    case kTabVerticalPadding:
++      return "--tab-vertical-padding";
++    case kTabTopCornerRadius:
++      return "--tab-top-corner-radius";
++    case kTabBottomCornerRadius:
++      return "--tab-bottom-corner-radius";
++    case kTabStripMaximizedAntiPadding:
++      return "--tab-strip-maximized-anti-padding";
++    case kTabFaviconYOffset:
++      return "--tab-favicon-y-offset";
++    case kTabFaviconXOffset:
++      return "--tab-favicon-x-offset";
++    case kTabCloseButtonXOffset:
++      return "--tab-close-button-x-offset";
++    case kTabStripPadWhenMaximized:
++      return "--tab-strip-pad-when-maximized";
++    case kTabOverlap:
++      return "--tab-overlap";
++    case kTabSeparatorOffset:
++      return "--tab-separator-offset";
++    case kTabHardBorder:
++      return "--tab-hard-border";
++    case kDrawLeftTabSeparator:
++      return "--draw-left-tab-separator";
++    case kDrawRightTabSeparator:
++      return "--draw-right-tab-separator";
++    case kTabCloseButtonYOffset:
++      return "--tab-close-button-y-offset";
++    case kTabTitleYOffset:
++      return "--tab-title-y-offset";
    }
    NOTREACHED();
  }
 diff --git a/ui/gfx/paint_vector_icon.cc b/ui/gfx/paint_vector_icon.cc
-index eef47b4c9b8de..4522cdb37ba72 100644
+index eef47b4c9b8de..85df59f05ff74 100644
 --- a/ui/gfx/paint_vector_icon.cc
 +++ b/ui/gfx/paint_vector_icon.cc
-@@ -9,13 +9,18 @@
- #include <tuple>
+@@ -6,16 +6,28 @@
  
+ #include <algorithm>
+ #include <map>
++#include <optional>
++#include <string>
+ #include <tuple>
++#include <vector>
+ 
++#include "base/command_line.h"
  #include "base/containers/span.h"
 +#include "base/files/file_util.h"
  #include "base/i18n/rtl.h"
  #include "base/lazy_instance.h"
  #include "base/memory/raw_span.h"
++#include "base/no_destructor.h"
  #include "base/numerics/safe_conversions.h"
 +#include "base/path_service.h"
 +#include "base/strings/string_number_conversions.h"
 +#include "base/strings/string_split.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/synchronization/lock.h"
  #include "base/trace_event/trace_event.h"
  #include "cc/paint/paint_canvas.h"
  #include "cc/paint/paint_flags.h"
-+#include "chrome/common/chrome_paths.h"
++#include "chrome/common/chrome_paths.h"  // nogncheck
  #include "third_party/skia/include/core/SkPath.h"
  #include "third_party/skia/include/core/SkPathBuilder.h"
  #include "third_party/skia/include/core/SkRRect.h"
-@@ -117,6 +122,66 @@ class PathParser {
+@@ -117,6 +129,80 @@ class PathParser {
    size_t command_index_ = 0;
  };
  
 +// Translates a string such as "MOVE_TO" into a command such as MOVE_TO.
-+CommandType CommandFromString(const std::string& source) {
++std::optional<CommandType> CommandFromString(const std::string& source) {
 +#define RETURN_IF_IS(command) \
 +  if (source == #command)     \
 +    return command;
@@ -1094,55 +1144,103 @@ index eef47b4c9b8de..4522cdb37ba72 100644
 +  RETURN_IF_IS(FLIPS_IN_RTL);
 +#undef RETURN_IF_IS
 +
-+  NOTREACHED() << "Unrecognized command: " << source;
++  return std::nullopt;
 +}
 +
-+std::vector<PathElement> PathFromSource(const std::string& source) {
-+  std::vector<PathElement> path;
++// Parses the textual form of a vector icon (as found in .icon files) into
++// |path|. Returns false if |source| contains an unknown command or a command
++// without all of its arguments, which PaintPath() would otherwise crash on.
++bool PathFromSource(const std::string& source, std::vector<PathElement>* path) {
 +  std::vector<std::string> pieces = base::SplitString(
 +      source, "\n ,", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++  int args_needed = 0;
 +  for (const auto& piece : pieces) {
 +    double value = 0;
 +    int hex_value = 0;
 +    if (base::StringToDouble(piece, &value)) {
-+      path.push_back(PathElement(SkDoubleToScalar(value)));
-+    } else if (base::HexStringToInt(piece, &hex_value))
-+      path.push_back(PathElement(SkIntToScalar(hex_value)));
-+    else
-+      path.push_back(PathElement(CommandFromString(piece)));
++      if (!args_needed)
++        return false;
++      path->push_back(PathElement(SkDoubleToScalar(value)));
++      --args_needed;
++    } else if (base::HexStringToInt(piece, &hex_value)) {
++      if (!args_needed)
++        return false;
++      path->push_back(PathElement(SkIntToScalar(hex_value)));
++      --args_needed;
++    } else {
++      std::optional<CommandType> command = CommandFromString(piece);
++      if (!command || args_needed)
++        return false;
++      path->push_back(PathElement(*command));
++      args_needed = GetCommandArgumentCount(*command);
++    }
 +  }
-+  return path;
++  return !path->empty() && !args_needed;
 +}
 +
  bool IsCommandTypeCurve(CommandType command) {
    return command == CUBIC_TO || command == R_CUBIC_TO ||
           command == CUBIC_TO_SHORTHAND || command == QUADRATIC_TO ||
-@@ -452,6 +517,24 @@ IconDescription::IconDescription(const VectorIcon& icon,
+@@ -452,6 +538,58 @@ IconDescription::IconDescription(const VectorIcon& icon,
  
  IconDescription::~IconDescription() {}
  
-+bool GetCustomIconPath(std::string icon_name, std::vector<PathElement>& custompath)
-+{
-+    base::FilePath userdir;
-+    if(!base::PathService::Get(chrome::DIR_USER_DATA, &userdir))
-+        return false; // Things are seriously wrong if the user data directory cannot be located.
-+    const base::FilePath userpath = userdir.Append(base::ASCIIToWide(icon_name));
-+    std::string bufstr;
-+    base::ReadFileToString(userpath, &bufstr);
++// Reads a user-defined replacement for the icon named |icon_name| from the
++// user data directory. Returns std::nullopt if there is none, or if it can't
++// be parsed.
++std::optional<std::vector<PathElement>> ReadCustomIconPath(
++    const std::string& icon_name) {
++  base::FilePath userdir;
++  if (!base::PathService::Get(chrome::DIR_USER_DATA, &userdir))
++    return std::nullopt;  // Things are seriously wrong if the user data directory cannot be located.
++  const base::FilePath userpath = userdir.Append(base::ASCIIToWide(icon_name));
++  std::string bufstr;
++  if (!base::ReadFileToString(userpath, &bufstr) || bufstr.empty())
++    return std::nullopt;
++  std::vector<PathElement> custompath;
++  if (!PathFromSource(bufstr, &custompath))
++    return std::nullopt;
++  return custompath;
++}
 +
-+    if (bufstr.empty())
-+        return false;
-+    else
-+    {
-+        custompath = PathFromSource(bufstr);
-+        return true;
-+	}
++bool GetCustomIconPath(const char* icon_name,
++                       std::vector<PathElement>& custompath) {
++  if (!icon_name)
++    return false;
++
++  // Icons are painted very often, so the files are only looked up once per
++  // icon, unless "live" customization was requested (as for the layout
++  // constants).
++  static const bool live_updates =
++      base::CommandLine::InitializedForCurrentProcess() &&
++      base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "enable-advanced-customization");
++  if (live_updates) {
++    std::optional<std::vector<PathElement>> path = ReadCustomIconPath(icon_name);
++    if (!path)
++      return false;
++    custompath = std::move(*path);
++    return true;
++  }
++
++  static base::NoDestructor<base::Lock> lock;
++  static base::NoDestructor<
++      std::map<std::string, std::optional<std::vector<PathElement>>>>
++      cache;
++  base::AutoLock auto_lock(*lock);
++  auto it = cache->find(icon_name);
++  if (it == cache->end())
++    it = cache->emplace(icon_name, ReadCustomIconPath(icon_name)).first;
++  if (!it->second)
++    return false;
++  custompath = *it->second;
++  return true;
 +}
 +
  void PaintVectorIcon(Canvas* canvas, const VectorIcon& icon, SkColor color) {
    PaintVectorIcon(canvas, icon, GetDefaultSizeOfVectorIcon(icon), color);
  }
-@@ -466,7 +549,11 @@ void PaintVectorIcon(Canvas* canvas,
+@@ -466,7 +604,11 @@ void PaintVectorIcon(Canvas* canvas,
    }
    const int px_size = base::ClampCeil(canvas->image_scale() * dip_size);
    const VectorIconRep* rep = GetRepForPxSize(icon, px_size);
@@ -1156,7 +1254,7 @@ index eef47b4c9b8de..4522cdb37ba72 100644
  
  ImageSkia CreateVectorIcon(const IconDescription& params) {
 diff --git a/ui/shell_dialogs/execute_select_file_win.cc b/ui/shell_dialogs/execute_select_file_win.cc
-index b9f46bd6ebf8d..0d0e4bf12d40e 100644
+index b9f46bd6ebf8d..d180db8927f8d 100644
 --- a/ui/shell_dialogs/execute_select_file_win.cc
 +++ b/ui/shell_dialogs/execute_select_file_win.cc
 @@ -4,16 +4,20 @@
@@ -1330,7 +1428,8 @@ index b9f46bd6ebf8d..0d0e4bf12d40e 100644
 +
 +      // According to MSDN, Win2000 will not resolve shortcuts, so we do it
 +      // ourselves.
-+      base::win::ResolveShortcut(paths->at(0), &paths->at(0), nullptr);
++      if (result)
++        base::win::ResolveShortcut(paths->back(), &paths->back(), nullptr);
 +	  
 +    }
 +    CoTaskMemFree(list);
@@ -1386,7 +1485,6 @@ index b9f46bd6ebf8d..0d0e4bf12d40e 100644
 +                                     const std::wstring& suggested_ext) {
 +  DCHECK(!filename.empty());
 +  std::wstring return_value = filename;
-+  LOG(ERROR) << filter_selected;
 +  // If we wanted a specific extension, but the user's filename deleted it or
 +  // changed it to something that the system doesn't understand, re-append.
 +  // Careful: Checking net::GetMimeTypeFromExtension() will only find
@@ -1521,9 +1619,11 @@ index b9f46bd6ebf8d..0d0e4bf12d40e 100644
 +						      OFN_PATHMUSTEXIST;
 +      wchar_t filename_buffer [UNICODE_STRING_MAX_CHARS];
 +	  filename_buffer[0] = L'\0';
++	  // Declared here, as |open_file_name| keeps pointing into it until
++	  // GetSaveFileNameW() returns.
++	  base::FilePath suggested_directory;
 +	  if (!default_path.empty()) {
 +		base::FilePath suggested_file_name;
-+		base::FilePath suggested_directory;
 +		if (IsDirectory(default_path)) {
 +		  suggested_directory = default_path;
 +		} else {
@@ -1543,7 +1643,7 @@ index b9f46bd6ebf8d..0d0e4bf12d40e 100644
 +			  // The filename is ignored if no initial directory is supplied.
 +				  base::wcslcpy(filename_buffer,
 +								suggested_file_name.value().c_str(),
-+								sizeof(filename_buffer));
++								std::size(filename_buffer));
 +			  }
 +		  }
 +	  }
@@ -1585,8 +1685,6 @@ index b9f46bd6ebf8d..0d0e4bf12d40e 100644
 +	  // Get the extension that was suggested to the user (when the Save As dialog
 +	  // was opened).
 +	  std::wstring suggested_ext = GetExtensionWithoutLeadingDot(default_path.Extension());
-+      LOG(ERROR) << suggested_ext;
-+	  LOG(ERROR) << filter_selected;
 +	  // If we can't get the extension from the default_path, we use the default
 +	  // extension passed in. This is to cover cases like when saving a web page,
 +	  // where we get passed in a name without an extension and a default extension
@@ -1806,7 +1904,7 @@ index b9f46bd6ebf8d..0d0e4bf12d40e 100644
  
  // Runs a Folder selection dialog box, passes back the selected folder in |path|
 diff --git a/ui/snapshot/snapshot_win.cc b/ui/snapshot/snapshot_win.cc
-index fc86bd5e38e0e..746023fcb9922 100644
+index fc86bd5e38e0e..37ea8aac0432f 100644
 --- a/ui/snapshot/snapshot_win.cc
 +++ b/ui/snapshot/snapshot_win.cc
 @@ -21,6 +21,11 @@
@@ -1829,7 +1927,7 @@ index fc86bd5e38e0e..746023fcb9922 100644
    gfx::Rect snapshot_bounds_in_window =
        snapshot_bounds_in_pixels + clip_rect_in_pixels.OffsetFromOrigin();
    gfx::Size bitmap_size(snapshot_bounds_in_window.right(),
-@@ -44,7 +50,31 @@ void GrabHwndSnapshot(HWND window_handle,
+@@ -44,7 +50,29 @@ void GrabHwndSnapshot(HWND window_handle,
    // the window that are drawn using DirectComposition.
    UINT flags = PW_CLIENTONLY | PW_RENDERFULLCONTENT;
  
@@ -1838,26 +1936,24 @@ index fc86bd5e38e0e..746023fcb9922 100644
 +	result = PrintWindow(window_handle, mem_hdc, flags);
 +  }
 +  else {
-+	// PrintWindow does not work for pre-Windows 8.1. So we'll use BitBlt.
-+	// Copying from the window's actual HDC doesn't work so let's just use the full screen HDC.
-+	// When a snapshot is captured the focus should be on the browser window anyway.
-+	HDC window_hdc = GetDC(NULL);
-+	
-+	RECT window_rect;
-+	
-+	memset(&window_rect, 0, sizeof(RECT));
-+	
-+	result = GetWindowRect(window_handle, &window_rect);
-+	
-+	 if (!result) {
-+    PLOG(ERROR) << "Failed to get valid rect for snapshot area.";
-+    return;
++    // PrintWindow does not work for pre-Windows 8.1. So we'll use BitBlt.
++    // Copying from the window's actual HDC doesn't work so let's just use the
++    // full screen HDC. When a snapshot is captured the focus should be on the
++    // browser window anyway. Like PW_CLIENTONLY above, copy the client area,
++    // starting at its top-left corner.
++    POINT client_origin = {0, 0};
++    if (!::ClientToScreen(window_handle, &client_origin)) {
++      LOG(ERROR) << "Failed to get valid rect for snapshot area.";
++      return;
 +    }
-+	// The left of the snapshot "window" rect is offset by 8 pixels to remove a bit of the dark grey showing through.
-+	result = BitBlt(mem_hdc, 0, 0, bitmap_size.width(), bitmap_size.height(), 
-+					window_hdc, window_rect.left + 8, window_rect.top, SRCCOPY);
-+	
-+	DeleteDC(window_hdc);
++    HDC screen_hdc = ::GetDC(nullptr);
++    if (!screen_hdc) {
++      LOG(ERROR) << "Failed to get the screen DC for the snapshot.";
++      return;
++    }
++    result = ::BitBlt(mem_hdc, 0, 0, bitmap_size.width(), bitmap_size.height(),
++                      screen_hdc, client_origin.x, client_origin.y, SRCCOPY);
++    ::ReleaseDC(nullptr, screen_hdc);
 +  }
    if (!result) {
      PLOG(ERROR) << "Failed to print window";
@@ -1889,7 +1985,7 @@ index a711c503287a7..e93be78a846d8 100644
    menu_horizontal_border_size = 0;
    submenu_horizontal_overlap = 0;
 diff --git a/ui/views/controls/menu/menu_config_win.cc b/ui/views/controls/menu/menu_config_win.cc
-index a2dae078ccbd3..e13fc4747dbae 100644
+index a2dae078ccbd3..09af2e0085036 100644
 --- a/ui/views/controls/menu/menu_config_win.cc
 +++ b/ui/views/controls/menu/menu_config_win.cc
 @@ -2,6 +2,7 @@
@@ -1909,10 +2005,10 @@ index a2dae078ccbd3..e13fc4747dbae 100644
 +      nonrounded_menu_vertical_border_size = 3;
 +      item_vertical_margin = 3;
 +      item_horizontal_border_padding = -2;
-+      icons_in_label = 10;
++      icons_in_label = true;
 +      separator_height = 7;
 +      separator_upper_height = 5;
-+      separator_upper_height = 5;
++      separator_lower_height = 5;
 +      corner_radius = 0;
 +  }
 +
@@ -1940,3 +2036,22 @@ index d243aa338748a..43a34addd0cfd 100644
    switch (token) {
      case ShapeSysTokens::kXSmall:
        return 4;
+diff --git a/ui/gfx/BUILD.gn b/ui/gfx/BUILD.gn
+index f669a4be5809a..d68db86fc4090 100644
+--- a/ui/gfx/BUILD.gn
++++ b/ui/gfx/BUILD.gn
+@@ -197,6 +197,14 @@ component("gfx") {
+     "//ui/base:ui_data_pack",
+   ]
+ 
++  # For the generated headers that chrome/common/chrome_paths.h includes
++  # (see paint_vector_icon.cc).
++  deps += [
++    "//build:branding_buildflags",
++    "//extensions/buildflags",
++    "//third_party/widevine/cdm:buildflags",
++  ]
++
+   if (is_android) {
+     sources += [
+       "android/achoreographer_compat.cc",
