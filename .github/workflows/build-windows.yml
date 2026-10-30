@@ -1,0 +1,177 @@
+name: build-windows
+
+# Builds Supermium for Windows x64 (Windows 10/11) on GitHub-hosted runners.
+# A runner job may take at most 6 hours, so the build is split into up to
+# 10 stages that hand the tree over through artifacts. The packaged browser is
+# uploaded as the "supermium-win64" artifact by the stage that finishes.
+on:
+  push:
+    paths:
+      - '*.patch'
+      - '*.diff'
+      - 'ci/**'
+      - '.github/workflows/build-windows.yml'
+      - '.github/actions/stage/**'
+  workflow_dispatch:
+    inputs:
+      official:
+        description: Official build (ThinLTO + PGO, much slower)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stage-1:
+    runs-on: windows-2022
+    timeout-minutes: 358
+    outputs:
+      finished: ${{ steps.stage.outputs.finished }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: stage
+        uses: ./.github/actions/stage
+        with:
+          stage: '1'
+          official: ${{ inputs.official == true }}
+
+  stage-2:
+    needs: stage-1
+    if: needs.stage-1.outputs.finished != 'true'
+    runs-on: windows-2022
+    timeout-minutes: 358
+    outputs:
+      finished: ${{ steps.stage.outputs.finished }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: stage
+        uses: ./.github/actions/stage
+        with:
+          stage: '2'
+          official: ${{ inputs.official == true }}
+
+  stage-3:
+    needs: stage-2
+    if: needs.stage-2.outputs.finished != 'true'
+    runs-on: windows-2022
+    timeout-minutes: 358
+    outputs:
+      finished: ${{ steps.stage.outputs.finished }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: stage
+        uses: ./.github/actions/stage
+        with:
+          stage: '3'
+          official: ${{ inputs.official == true }}
+
+  stage-4:
+    needs: stage-3
+    if: needs.stage-3.outputs.finished != 'true'
+    runs-on: windows-2022
+    timeout-minutes: 358
+    outputs:
+      finished: ${{ steps.stage.outputs.finished }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: stage
+        uses: ./.github/actions/stage
+        with:
+          stage: '4'
+          official: ${{ inputs.official == true }}
+
+  stage-5:
+    needs: stage-4
+    if: needs.stage-4.outputs.finished != 'true'
+    runs-on: windows-2022
+    timeout-minutes: 358
+    outputs:
+      finished: ${{ steps.stage.outputs.finished }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: stage
+        uses: ./.github/actions/stage
+        with:
+          stage: '5'
+          official: ${{ inputs.official == true }}
+
+  stage-6:
+    needs: stage-5
+    if: needs.stage-5.outputs.finished != 'true'
+    runs-on: windows-2022
+    timeout-minutes: 358
+    outputs:
+      finished: ${{ steps.stage.outputs.finished }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: stage
+        uses: ./.github/actions/stage
+        with:
+          stage: '6'
+          official: ${{ inputs.official == true }}
+
+  stage-7:
+    needs: stage-6
+    if: needs.stage-6.outputs.finished != 'true'
+    runs-on: windows-2022
+    timeout-minutes: 358
+    outputs:
+      finished: ${{ steps.stage.outputs.finished }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: stage
+        uses: ./.github/actions/stage
+        with:
+          stage: '7'
+          official: ${{ inputs.official == true }}
+
+  stage-8:
+    needs: stage-7
+    if: needs.stage-7.outputs.finished != 'true'
+    runs-on: windows-2022
+    timeout-minutes: 358
+    outputs:
+      finished: ${{ steps.stage.outputs.finished }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: stage
+        uses: ./.github/actions/stage
+        with:
+          stage: '8'
+          official: ${{ inputs.official == true }}
+
+  stage-9:
+    needs: stage-8
+    if: needs.stage-8.outputs.finished != 'true'
+    runs-on: windows-2022
+    timeout-minutes: 358
+    outputs:
+      finished: ${{ steps.stage.outputs.finished }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: stage
+        uses: ./.github/actions/stage
+        with:
+          stage: '9'
+          official: ${{ inputs.official == true }}
+
+  stage-10:
+    needs: stage-9
+    if: needs.stage-9.outputs.finished != 'true'
+    runs-on: windows-2022
+    timeout-minutes: 358
+    outputs:
+      finished: ${{ steps.stage.outputs.finished }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: stage
+        uses: ./.github/actions/stage
+        with:
+          stage: '10'
+          official: ${{ inputs.official == true }}

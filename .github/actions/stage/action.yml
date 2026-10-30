@@ -1,0 +1,129 @@
+name: Supermium build stage
+description: >
+  Runs one stage of the staged Windows build. A stage continues from the state
+  saved by the previous stage (or by the run named in ci/resume.json), builds
+  until its deadline and saves the state again, or packages the browser.
+inputs:
+  stage:
+    description: Number of this stage, starting at 1
+    required: true
+  official:
+    description: Build with is_official_build=true (ThinLTO and PGO; much slower)
+    required: false
+    default: 'false'
+outputs:
+  finished:
+    description: Whether the browser is built and uploaded
+    value: ${{ steps.build.outputs.finished }}
+runs:
+  using: composite
+  steps:
+    - name: Prepare runner
+      shell: pwsh
+      run: ./ci/prepare_runner.ps1
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+
+    - name: Find the state to continue from
+      id: resume
+      shell: pwsh
+      run: |
+        $stage = [int]'${{ inputs.stage }}'
+        if ($stage -gt 1) {
+          "artifact=state-$($stage - 1)" >> $env:GITHUB_OUTPUT
+          "run_id=${{ github.run_id }}" >> $env:GITHUB_OUTPUT
+        } else {
+          $resume = Get-Content ci/resume.json -Raw | ConvertFrom-Json
+          if ($resume.run_id -and $resume.artifact) {
+            Write-Host "Continuing from $($resume.artifact) of run $($resume.run_id)"
+            "artifact=$($resume.artifact)" >> $env:GITHUB_OUTPUT
+            "run_id=$($resume.run_id)" >> $env:GITHUB_OUTPUT
+          }
+        }
+
+    - name: Download the state
+      if: steps.resume.outputs.artifact != ''
+      uses: actions/download-artifact@v8
+      with:
+        name: ${{ steps.resume.outputs.artifact }}
+        path: ${{ env.SM_ROOT }}\dl
+        run-id: ${{ steps.resume.outputs.run_id }}
+        github-token: ${{ github.token }}
+
+    - name: Unpack the state
+      if: steps.resume.outputs.artifact != ''
+      shell: pwsh
+      run: |
+        $t = Get-Date
+        & 7z x "$env:SM_ROOT\dl\state.zip.001" "-o$env:SM_ROOT" -y -bso0 -bsp0
+        if ($LASTEXITCODE) { exit 1 }
+        Remove-Item -Recurse -Force "$env:SM_ROOT\dl"
+        Write-Host ("unpacked in {0:n0} min" -f ((Get-Date) - $t).TotalMinutes)
+
+    - name: Build
+      id: build
+      shell: pwsh
+      run: |
+        # Stop ninja 4 h 50 min after the stage started; packing and uploading
+        # the state has to fit into the rest of the 6 hour job limit.
+        $deadline = [int64]$env:SM_JOB_START + 290 * 60
+        $buildArgs = @('ci/build.py', '--root', $env:SM_ROOT, '--deadline', $deadline, '--jobs', '4')
+        if ('${{ inputs.official }}' -eq 'true') { $buildArgs += '--official' }
+        python @buildArgs
+        $rc = $LASTEXITCODE
+        Write-Host "build.py exit code: $rc"
+        "rc=$rc" >> $env:GITHUB_OUTPUT
+        "finished=$(if ($rc -eq 0) { 'true' } else { 'false' })" >> $env:GITHUB_OUTPUT
+        exit 0
+
+    - name: Pack the state
+      if: steps.build.outputs.rc == '124' || steps.build.outputs.rc == '125'
+      shell: pwsh
+      run: |
+        $t = Get-Date
+        Set-Location $env:SM_ROOT
+        $items = @('src', 'depot_tools', 'applied', 'state.json', '.gclient') | Where-Object { Test-Path $_ }
+        & 7z a -tzip -mx=1 -mmt=on -mtc=on -v3900m -bso0 -bsp0 "$env:SM_ROOT\pack\state.zip" @items
+        if ($LASTEXITCODE) { exit 1 }
+        Get-ChildItem pack | ForEach-Object { Write-Host ("{0}: {1:n1} GB" -f $_.Name, ($_.Length / 1GB)) }
+        Write-Host ("packed in {0:n0} min" -f ((Get-Date) - $t).TotalMinutes)
+
+    - name: Upload the state
+      if: steps.build.outputs.rc == '124' || steps.build.outputs.rc == '125'
+      uses: actions/upload-artifact@v7
+      with:
+        name: state-${{ inputs.stage }}
+        path: ${{ env.SM_ROOT }}\pack\
+        retention-days: 3
+        compression-level: 0
+
+    - name: Upload the build errors
+      if: steps.build.outputs.rc != '0' && steps.build.outputs.rc != '124'
+      uses: actions/upload-artifact@v7
+      with:
+        name: errors-${{ inputs.stage }}
+        path: ${{ env.SM_ROOT }}\logs\errors.txt
+        if-no-files-found: ignore
+
+    - name: Upload the browser
+      if: steps.build.outputs.rc == '0'
+      uses: actions/upload-artifact@v7
+      with:
+        name: supermium-win64
+        path: ${{ env.SM_ROOT }}\dist\
+        retention-days: 30
+        compression-level: 0
+
+    - name: Fail on build errors
+      if: steps.build.outputs.rc != '0' && steps.build.outputs.rc != '124'
+      shell: pwsh
+      run: |
+        if ('${{ steps.build.outputs.rc }}' -eq '125') {
+          Write-Host "::error::Build errors, see errors-${{ inputs.stage }}. The tree was saved as state-${{ inputs.stage }} of run ${{ github.run_id }}; put both into ci/resume.json to continue from it after fixing the patches."
+        } else {
+          Write-Host "::error::build.py failed with exit code ${{ steps.build.outputs.rc }}"
+        }
+        exit 1

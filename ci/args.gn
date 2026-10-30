@@ -1,0 +1,15 @@
+# GN arguments for the Windows x64 build of Supermium on GitHub Actions.
+# build.py appends is_official_build (and the PGO phase for official builds).
+target_cpu = "x64"
+is_debug = false
+is_component_build = false
+dcheck_always_on = false
+symbol_level = 0
+blink_symbol_level = 0
+v8_symbol_level = 0
+proprietary_codecs = true
+ffmpeg_branding = "Chrome"
+# The patches were never built with -Werror; don't fail on warnings.
+treat_warnings_as_errors = false
+# Build with ninja, not siso.
+use_siso = false
