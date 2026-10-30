@@ -1204,10 +1204,18 @@ index 0c207bfaa23fc..174309b0ad883 100644
  }
  
 diff --git a/components/url_formatter/url_fixer.cc b/components/url_formatter/url_fixer.cc
-index 020fef557948d..0f2a436bbf12c 100644
+index d5d9a14c8d3d5..c84b9907cfea6 100644
 --- a/components/url_formatter/url_fixer.cc
 +++ b/components/url_formatter/url_fixer.cc
-@@ -639,7 +639,10 @@ GURL FixupURLInternal(const std::string& text,
+@@ -10,6 +10,7 @@
+ #include <string_view>
+ 
+ #include "base/check_op.h"
++#include "base/command_line.h"
+ #include "base/compiler_specific.h"
+ #include "base/files/file_path.h"
+ #include "base/files/file_util.h"
+@@ -634,7 +635,10 @@ GURL FixupURLInternal(const std::string& text,
        FixupHost(trimmed.substr(parts.host.begin, parts.host.len),
                   desired_tld, &url);
      }

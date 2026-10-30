@@ -87,7 +87,9 @@ runs:
         Set-Location $env:SM_ROOT
         $items = @('src', 'depot_tools', 'applied', 'state.json', '.gclient') | Where-Object { Test-Path $_ }
         & 7z a -tzip -mx=1 -mmt=on -mtc=on -v3900m -bso0 -bsp0 "$env:SM_ROOT\pack\state.zip" @items
-        if ($LASTEXITCODE) { exit 1 }
+        # Exit code 1 is a warning: a few dangling symlinks of other
+        # platforms in the checkout can't be read, which doesn't matter.
+        if ($LASTEXITCODE -gt 1) { exit 1 }
         Get-ChildItem pack | ForEach-Object { Write-Host ("{0}: {1:n1} GB" -f $_.Name, ($_.Length / 1GB)) }
         Write-Host ("packed in {0:n0} min" -f ((Get-Date) - $t).TotalMinutes)
 
@@ -101,7 +103,7 @@ runs:
         compression-level: 0
 
     - name: Upload the build errors
-      if: steps.build.outputs.rc != '0' && steps.build.outputs.rc != '124'
+      if: always() && steps.build.outputs.rc != '0' && steps.build.outputs.rc != '124'
       uses: actions/upload-artifact@v7
       with:
         name: errors-${{ inputs.stage }}
@@ -118,7 +120,7 @@ runs:
         compression-level: 0
 
     - name: Fail on build errors
-      if: steps.build.outputs.rc != '0' && steps.build.outputs.rc != '124'
+      if: always() && steps.build.outputs.rc != '0' && steps.build.outputs.rc != '124'
       shell: pwsh
       run: |
         if ('${{ steps.build.outputs.rc }}' -eq '125') {
