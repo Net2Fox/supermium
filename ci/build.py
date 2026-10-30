@@ -170,9 +170,11 @@ def sync(root, pgo):
             cwd=depot_tools)
         run(['git', 'checkout', '-q', 'FETCH_HEAD'], cwd=depot_tools)
     # depot_tools runs git through git.bat, which only its full bootstrap
-    # creates. Point it at the runner's git.
-    git = shutil.which('git')
-    (depot_tools / 'git.bat').write_text('@"%s" %%*\n' % git, encoding='utf-8')
+    # creates. Point it at the runner's git, in the form that depot_tools'
+    # git_common.py parses (an absolute path to git.exe on the last line).
+    git = os.path.splitext(shutil.which('git'))[0] + '.exe'
+    (depot_tools / 'git.bat').write_text('@echo off\n"%s" %%*\n' % git,
+                                         encoding='utf-8')
     # Bootstraps depot_tools' own Python and other tools.
     run([depot_tools / 'gclient.bat', '--version'], cwd=root)
 
