@@ -364,11 +364,16 @@ def run_ninja(root, targets, deadline, jobs, label):
                 continue
             if line.startswith('FAILED: '):
                 capturing = True
+                if timed_out:
+                    # A step that the deadline killed, not a build error.
+                    print('(stopped at the deadline) ' + line.rstrip(), flush=True)
+                    continue
                 failed_steps += 1
                 print('::error::' + line.rstrip(), flush=True)
             if capturing or line.startswith('ninja: '):
                 print(line.rstrip(), flush=True)
-                errors.write(line)
+                if not timed_out:
+                    errors.write(line)
     proc.wait()
     if timed_out:
         # Give killed compilers a moment to release their files.

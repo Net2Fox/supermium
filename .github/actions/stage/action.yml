@@ -59,9 +59,12 @@ runs:
       run: |
         $t = Get-Date
         & 7z x "$env:SM_ROOT\dl\state.zip.001" "-o$env:SM_ROOT" -y -bso0 -bsp0
-        if ($LASTEXITCODE) { exit 1 }
+        # Exit code 1 is a warning, see "Pack the state".
+        if ($LASTEXITCODE -gt 1) { exit 1 }
         Remove-Item -Recurse -Force "$env:SM_ROOT\dl"
         Write-Host ("unpacked in {0:n0} min" -f ((Get-Date) - $t).TotalMinutes)
+        # pwsh steps otherwise fail with the last native exit code.
+        exit 0
 
     - name: Build
       id: build
@@ -92,6 +95,8 @@ runs:
         if ($LASTEXITCODE -gt 1) { exit 1 }
         Get-ChildItem pack | ForEach-Object { Write-Host ("{0}: {1:n1} GB" -f $_.Name, ($_.Length / 1GB)) }
         Write-Host ("packed in {0:n0} min" -f ((Get-Date) - $t).TotalMinutes)
+        # pwsh steps otherwise fail with the last native exit code.
+        exit 0
 
     - name: Upload the state
       if: steps.build.outputs.rc == '124' || steps.build.outputs.rc == '125'
