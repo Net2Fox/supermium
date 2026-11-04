@@ -179,6 +179,16 @@ git -C third_party/search_engines_data/resources apply "$SUPERMIUM/search_engine
   перезаписываются. `TemplateURLFetcher::ScheduleDownload()` с этим флагом не скачивает
   OpenSearch-описание. Теперь блокируются и движки из OpenSearch-описаний, и ключевые слова из
   отправленных форм, а лишних сетевых запросов нет.
+* **`--omnibox-autocomplete-filtering` почти не работал** (`general_features`, найдено после
+  сборки). В 144 главная часть флага была в конструкторе `AutocompleteController`: при включённом
+  флаге он оставлял только поиск, ключевые слова и, в зависимости от варианта, закладки и
+  внутренние страницы `chrome://`. При переносе на 150 этот блок потерялся, и остались только
+  проверки в `HistoryURLProvider` и `SearchProvider`. Поэтому подсказки из истории
+  (`HistoryQuickProvider`), ярлыков, буфера обмена, открытых вкладок и других источников
+  продолжали появляться. Блок возвращён: новый раздел патча для `autocomplete_controller.cc`
+  (вместо `base::Contains` здесь `std::string::find`, чтобы не тянуть лишний заголовок).
+  Подсказки самой поисковой системы этот флаг не отключает, для этого есть настройка
+  «Автозаполнение поисковых запросов и URL» в `chrome://settings/syncSetup`.
 * **`render_frame_impl.cc`** (`general_features`): для Windows добавлена отдельная ветка
   `DUMP_WILL_BE_CHECK(!in_frame_tree_)`. Задуманное смягчение `CHECK` теперь действительно
   работает: на Windows создаётся дамп без падения рендерера.
