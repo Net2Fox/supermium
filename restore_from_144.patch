@@ -525,6 +525,24 @@ index 73204bb..95afebb 100644
      layout_constant_values[(int)LayoutConstant::kTabTopCornerRadius] = 10;
      layout_constant_values[(int)LayoutConstant::kTabBottomCornerRadius] = 12;
      layout_constant_values[(int)LayoutConstant::kTabStripMaximizedAntiPadding] = 4;
+diff --git a/chrome/browser/ui/tab_search_feature.cc b/chrome/browser/ui/tab_search_feature.cc
+index d30b61b..0d05ce1 100644
+--- a/chrome/browser/ui/tab_search_feature.cc
++++ b/chrome/browser/ui/tab_search_feature.cc
+@@ -10,8 +10,10 @@
+ 
+ namespace features {
+ bool HasTabSearchToolbarButton() {
+-  // It is important that this value not change at runtime in production. Any
+-  // future updates to this function must maintain that property.
+-  return glic::GlicEnabling::IsEnabledByGlobalCriteria();
++  // Supermium: Tab Search is never a toolbar button, as in Supermium 144
++  // (there it needed a stored "us" variations country, which unbranded builds
++  // never have). Upstream ties it to Glic's global criteria, whose country
++  // comes from the Windows region (variations::GetCurrentCountryCode()).
++  return false;
+ }
+ }  // namespace features
 diff --git a/chrome/browser/ui/tabs/features.cc b/chrome/browser/ui/tabs/features.cc
 index df3758a..8c3218c 100644
 --- a/chrome/browser/ui/tabs/features.cc
@@ -693,7 +711,7 @@ index f829637..f20e159 100644
  }
  
 diff --git a/chrome/browser/ui/views/frame/browser_view.cc b/chrome/browser/ui/views/frame/browser_view.cc
-index 4019e26..8c154e4 100644
+index 4019e26..33d8031 100644
 --- a/chrome/browser/ui/views/frame/browser_view.cc
 +++ b/chrome/browser/ui/views/frame/browser_view.cc
 @@ -1317,6 +1317,12 @@ bool BrowserView::ShouldDrawTabStrokes() const {
@@ -709,20 +727,8 @@ index 4019e26..8c154e4 100644
    bool using_system_theme = false;
    if (GetProfile()) {
      auto* theme_service = ThemeServiceFactory::GetForProfile(GetProfile());
-@@ -4184,8 +4190,9 @@ void BrowserView::UpdateTabSearchBubbleHost() {
-           combo_button->end_button(), browser_.get());
-       combo_button->SetTabSearchBubbleHost(tab_search_bubble_host_.get());
-     }
--  } else if (tabs::GetTabSearchPosition(browser_) ==
--             tabs::TabSearchPosition::kToolbarButton) {
-+  } else if (!remove_tab_search_button &&
-+             tabs::GetTabSearchPosition(browser_) ==
-+                 tabs::TabSearchPosition::kToolbarButton) {
-     tab_search_bubble_host_ = std::make_unique<TabSearchBubbleHost>(
-         toolbar_->tab_search_button(), browser_.get());
-     auto* toolbar_button_controller =
 diff --git a/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc b/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
-index 0a1124e..c8904a0 100644
+index 0a1124e..c1feb55 100644
 --- a/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
 +++ b/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
 @@ -111,6 +111,10 @@ class FrameGrabHandle : public views::View {
@@ -736,6 +742,23 @@ index 0a1124e..c8904a0 100644
      return gfx::Size(42, 0);
    }
  
+@@ -288,10 +292,12 @@ HorizontalTabStripRegionView::HorizontalTabStripRegionView(
+           browser, browser->GetFeatures().glic_nudge_controller());
+       tab_strip_action_container->SetProperty(views::kCrossAxisAlignmentKey,
+                                               views::LayoutAlignment::kStart);
+-    } else if (!base::FeatureList::IsEnabled(
+-                   tabs::kHorizontalTabStripComboButton) &&
+-               !base::CommandLine::ForCurrentProcess()->HasSwitch(
+-                   "remove-tabsearch-button")) {
++    }
++    // Supermium: the standalone Tab Search button does not depend on Glic
++    // (features::HasTabSearchToolbarButton() is always false), as in 144.
++    if (!base::FeatureList::IsEnabled(tabs::kHorizontalTabStripComboButton) &&
++        !base::CommandLine::ForCurrentProcess()->HasSwitch(
++            "remove-tabsearch-button")) {
+       tab_search_button =
+           std::make_unique<TabSearchButton>(browser, Edge::kNone, Edge::kNone);
+       tab_search_button->SetProperty(views::kCrossAxisAlignmentKey,
 diff --git a/chrome/browser/ui/views/frame/opaque_browser_frame_view.cc b/chrome/browser/ui/views/frame/opaque_browser_frame_view.cc
 index be7c8cc..e574d03 100644
 --- a/chrome/browser/ui/views/frame/opaque_browser_frame_view.cc
@@ -1128,21 +1151,6 @@ index 7eb01ec..887048d 100644
   private:
    std::unique_ptr<NewTabButtonMenuModel> context_menu_model_;
    std::unique_ptr<views::MenuRunner> context_menu_runner_;
-diff --git a/chrome/browser/ui/views/toolbar/toolbar_view.cc b/chrome/browser/ui/views/toolbar/toolbar_view.cc
-index e37ae1a..e02fee3 100644
---- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
-+++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
-@@ -502,7 +502,9 @@ void ToolbarView::Init() {
-   }
- 
-   if (!base::FeatureList::IsEnabled(tabs::kHorizontalTabStripComboButton) &&
--      features::HasTabSearchToolbarButton()) {
-+      features::HasTabSearchToolbarButton() &&
-+      !base::CommandLine::ForCurrentProcess()->HasSwitch(
-+          "remove-tabsearch-button")) {
-     CHECK(!features::IsWebUIPinnedToolbarActionsEnabled())
-         << "WebUIPinnedToolbarActions does not support "
-            "CreatePermanentButtonFor, consider enabling "
 diff --git a/chrome/browser/ui/webui/settings/settings_utils_win.cc b/chrome/browser/ui/webui/settings/settings_utils_win.cc
 index adfc01c..b2c918d 100644
 --- a/chrome/browser/ui/webui/settings/settings_utils_win.cc
@@ -3751,6 +3759,40 @@ index 1d56eed..805d2e5 100644
        image = iter->unscaled() ? (*iter) : ScaleImageSkiaRep(*iter, scale);
      } else {
        image = source_->GetImageForScale(scale);
+diff --git a/ui/gfx/win/direct_write.cc b/ui/gfx/win/direct_write.cc
+index 83a9552..245e8e5 100644
+--- a/ui/gfx/win/direct_write.cc
++++ b/ui/gfx/win/direct_write.cc
+@@ -16,7 +16,10 @@
+ #include "base/debug/alias.h"
+ #include "base/notreached.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/threading/platform_thread.h"
++#include "base/time/time.h"
+ #include "base/trace_event/trace_event.h"
++#include "base/win/windows_version.h"
+ #include "skia/ext/font_utils.h"
+ #include "third_party/skia/include/core/SkFontMgr.h"
+ #include "third_party/skia/include/ports/SkTypeface_win.h"
+@@ -165,6 +168,18 @@ void InitializeDirectWrite() {
+ 
+   sk_sp<SkFontMgr> direct_write_font_mgr = SkFontMgr_New_DirectWrite(
+       factory.Get(), should_use_collection ? collection.Get() : nullptr);
++  // Supermium: GetSystemFontCollection() can fail with E_INVALIDARG on
++  // Windows 7 RTM (6.1.7600) until the service sections are mapped
++  // (crbug.com/956064). Retry a few times, as Chromium did before M110.
++  if (!direct_write_font_mgr &&
++      base::win::GetVersion() == base::win::Version::WIN7) {
++    constexpr int kMaxRetries = 5;
++    for (int i = 0; i < kMaxRetries && !direct_write_font_mgr; ++i) {
++      base::PlatformThread::Sleep(base::Microseconds(500));
++      direct_write_font_mgr = SkFontMgr_New_DirectWrite(
++          factory.Get(), should_use_collection ? collection.Get() : nullptr);
++    }
++  }
+   CHECK(!!direct_write_font_mgr);
+ 
+   // Override the default skia font manager. This must be called before any
 diff --git a/ui/gl/gl_features.cc b/ui/gl/gl_features.cc
 index 3434e8f..6668f12 100644
 --- a/ui/gl/gl_features.cc
