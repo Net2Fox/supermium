@@ -1,0 +1,4430 @@
+diff --git a/base/win/registry.cc b/base/win/registry.cc
+index 7bb1482..f951fb8 100644
+--- a/base/win/registry.cc
++++ b/base/win/registry.cc
+@@ -25,6 +25,7 @@
+ #include "base/win/object_watcher.h"
+ #include "base/win/scoped_handle.h"
+ #include "base/win/shlwapi.h"
++#include "base/win/windows_version.h"
+ 
+ extern "C" NTSTATUS WINAPI NtDeleteKey(IN HANDLE KeyHandle);
+ 
+@@ -97,8 +98,11 @@ bool RegKey::Watcher::StartWatching(HKEY key, ChangeCallback callback) {
+   }
+ 
+   DWORD filter = REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_ATTRIBUTES |
+-                 REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_SECURITY |
+-                 REG_NOTIFY_THREAD_AGNOSTIC;
++                 REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_SECURITY;
++  // REG_NOTIFY_THREAD_AGNOSTIC is only supported on Windows 8 and later.
++  if (base::win::GetVersion() >= base::win::Version::WIN8) {
++    filter |= REG_NOTIFY_THREAD_AGNOSTIC;
++  }
+   // Watch the registry key for a change of value.
+   LONG result =
+       RegNotifyChangeKeyValue(key, /*bWatchSubtree=*/TRUE, filter,
+diff --git a/build/config/win/BUILD.gn b/build/config/win/BUILD.gn
+index 101c233..2fec5b8 100644
+--- a/build/config/win/BUILD.gn
++++ b/build/config/win/BUILD.gn
+@@ -119,8 +119,22 @@ config("compiler") {
+     # Chrome currently requires SSE3. Clang supports targeting any Intel
+     # microarchitecture. MSVC only supports a subset of architectures, and the
+     # next step after SSE2 will be AVX.
++    # Supermium: the 32-bit build supports SSE2-only processors; the 64-bit
++    # build keeps SSE3.
+     if (current_cpu == "x86" || current_cpu == "x64") {
+-      cflags += [ "-msse3" ]
++      if (!is_debug) {
++        cflags += [ "/O2" ]
++      }
++      if (target_cpu == "x64") {
++        cflags += [ "-msse3" ]
++      } else {
++        cflags += [
++          "-mmmx",
++          "-mfxsr",
++          "-msse",
++          "-msse2",
++        ]
++      }
+     }
+ 
+     # Enable ANSI escape codes if something emulating them is around (cmd.exe
+@@ -629,9 +643,19 @@ config("static_crt") {
+ # Subsystem --------------------------------------------------------------------
+ 
+ # This is appended to the subsystem to specify a minimum version.
+-# The number after the comma is the minimum required OS version.
+-# Set to 10.0 since we only support >= Win10 since M110.
+-subsystem_version_suffix = ",10.0"
++# Supermium: allow the binaries to load before Windows 10 (the loader refuses
++# images whose subsystem version is newer than the running OS).
++if (current_cpu == "x64") {
++  # The number after the comma is the minimum required OS version.
++  # 5.02 = Windows Server 2003 / XP x64 (matches the official binaries).
++  subsystem_version_suffix = ",5.02"
++} else if (current_cpu == "arm64") {
++  # Windows ARM64 requires Windows 10.
++  subsystem_version_suffix = ",10.0"
++} else {
++  # 5.01 = Windows XP.
++  subsystem_version_suffix = ",5.01"
++}
+ 
+ config("console") {
+   ldflags = [ "/SUBSYSTEM:CONSOLE$subsystem_version_suffix" ]
+diff --git a/chrome/app/chromium_strings.grd b/chrome/app/chromium_strings.grd
+index 0443cb4..5ea827e 100644
+--- a/chrome/app/chromium_strings.grd
++++ b/chrome/app/chromium_strings.grd
+@@ -1159,7 +1159,7 @@ Chromium is unable to recover your settings.
+ 
+       <!-- Chrome sign-in page -->
+       <message name="IDS_CHROME_SIGNIN_TITLE" desc="Title on the about:chrome-signin page" translateable="false">
+-        Chromium
++        Supermium
+       </message>
+ 
+       <!-- DICE sign-in promo strings -->
+diff --git a/chrome/browser/browser_process_impl.cc b/chrome/browser/browser_process_impl.cc
+index f699d8b..a670f6d 100644
+--- a/chrome/browser/browser_process_impl.cc
++++ b/chrome/browser/browser_process_impl.cc
+@@ -641,7 +641,9 @@ void BrowserProcessImpl::StartTearDown() {
+ #endif  // BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+ 
+   // Need to clear profiles (download managers) before the IO thread.
+-  {
++  // In --single-process mode the in-process RenderProcessHost is never
++  // destroyed, so tearing down the profiles here would crash.
++  if (!content::RenderProcessHost::run_renderer_in_process()) {
+     TRACE_EVENT0("shutdown",
+                  "BrowserProcessImpl::StartTearDown:ProfileManager");
+ #if !BUILDFLAG(IS_CHROMEOS)
+diff --git a/chrome/browser/chrome_browser_main.cc b/chrome/browser/chrome_browser_main.cc
+index 91beab3..033e695 100644
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -241,6 +241,7 @@
+ #endif
+ 
+ #if BUILDFLAG(IS_WIN)
++#include "base/win/windows_version.h"
+ #include "chrome/browser/first_run/upgrade_util_win.h"
+ #include "chrome/browser/notifications/win/notification_launch_id.h"
+ #include "chrome/browser/startup/startup_launch_manager.h"
+@@ -249,6 +250,7 @@
+ #include "chrome/browser/win/browser_util.h"
+ #include "chrome/browser/win/chrome_select_file_dialog_factory.h"
+ #include "chrome/browser/win/parental_controls.h"
++#include "sandbox/policy/switches.h"
+ #include "ui/shell_dialogs/select_file_dialog.h"
+ 
+ #if BUILDFLAG(USE_BROWSER_SPELLCHECKER)
+@@ -1330,8 +1332,23 @@ int ChromeBrowserMainParts::PreCreateThreadsImpl() {
+       ui::TouchUiController::Get());
+ #endif
+ 
+-  // Add Site Isolation switches as dictated by policy.
+   auto* command_line = base::CommandLine::ForCurrentProcess();
++#if BUILDFLAG(IS_WIN)
++  // Use a special legacy sandbox if running less than Windows 10. On XP the
++  // GPU process doesn't survive even that, so run without the sandbox there
++  // (as the author's own 150 build does).
++  if (base::win::GetVersion() <= base::win::Version::XP) {
++    if (!command_line->HasSwitch(sandbox::policy::switches::kNoSandbox)) {
++      command_line->AppendSwitch(sandbox::policy::switches::kNoSandbox);
++    }
++  } else if (base::win::GetVersion() < base::win::Version::WIN10 &&
++             !command_line->HasSwitch(sandbox::policy::switches::kNoSandbox) &&
++             !command_line->HasSwitch("legacy-sandbox")) {
++    command_line->AppendSwitch("legacy-sandbox");
++  }
++#endif
++
++  // Add Site Isolation switches as dictated by policy.
+   if (local_state->GetBoolean(prefs::kSitePerProcess) &&
+       site_isolation::SiteIsolationPolicy::IsEnterprisePolicyApplicable() &&
+       !command_line->HasSwitch(switches::kSitePerProcess)) {
+diff --git a/chrome/browser/device_reauth/win/authenticator_win.cc b/chrome/browser/device_reauth/win/authenticator_win.cc
+index 243e7b9..dd970ca 100644
+--- a/chrome/browser/device_reauth/win/authenticator_win.cc
++++ b/chrome/browser/device_reauth/win/authenticator_win.cc
+@@ -154,6 +154,11 @@ void GetBiometricAvailabilityFromWindows(
+   // (http://crbug.com/41464781).
+   SCOPED_MAY_LOAD_LIBRARY_AT_BACKGROUND_PRIORITY();
+ 
++  if (base::win::GetVersion() < base::win::Version::WIN8) {
++    ReportCantCheckAvailability(thread, std::move(callback));
++    return;
++  }
++
+   ComPtr<IUserConsentVerifierStatics> factory;
+   HRESULT hr = base::win::GetActivationFactory<
+       IUserConsentVerifierStatics,
+@@ -360,6 +365,18 @@ void AuthenticatorWin::AuthenticateUser(
+     base::OnceCallback<void(bool)> result_callback) {
+   RecordAuthenticationState(AuthenticationStateWin::kStarted);
+ 
++  // Windows Hello (UserConsentVerifier) needs WinRT, which Windows only has
++  // from Windows 8 on (older systems at most have progwrp's emulation of it).
++  // Go straight to the OS password prompt that a failed activation falls back
++  // to.
++  if (base::win::GetVersion() < base::win::Version::WIN8) {
++    AuthenticateWithLegacyApi(
++        message, std::move(result_callback)
++                     .Then(base::BindOnce(RecordAuthenticationState,
++                                          AuthenticationStateWin::kFinished)));
++    return;
++  }
++
+   if (base::win::GetVersion() >= base::win::Version::WIN11) {
+     PerformInteropWindowsHelloAuthenticationAsync(
+         std::move(result_callback)
+diff --git a/chrome/browser/external_protocol/external_protocol_handler.cc b/chrome/browser/external_protocol/external_protocol_handler.cc
+index 4095382..3c5ede0 100644
+--- a/chrome/browser/external_protocol/external_protocol_handler.cc
++++ b/chrome/browser/external_protocol/external_protocol_handler.cc
+@@ -197,8 +197,11 @@ void LaunchUrlWithoutSecurityCheckWithDelegate(
+   }
+ 
+ #if BUILDFLAG(SAFE_BROWSING_AVAILABLE)
+-  g_browser_process->safe_browsing_service()->ReportExternalAppRedirect(
+-      web_contents, url.GetScheme(), url.possibly_invalid_spec());
++  // The service is not created with --ungoogled-supermium.
++  if (g_browser_process->safe_browsing_service()) {
++    g_browser_process->safe_browsing_service()->ReportExternalAppRedirect(
++        web_contents, url.GetScheme(), url.possibly_invalid_spec());
++  }
+ #endif
+ 
+   // |web_contents| is only passed in to find browser context. Do not assume
+@@ -633,6 +636,9 @@ void ExternalProtocolHandler::LaunchUrlWithoutSecurityCheck(
+   // TODO(crbug.com/40551459): This essentially amounts to "remove illegal
+   // characters from the URL", something that probably should be done by the
+   // GURL constructor itself.
++  if (url.spec().empty()) {
++    return;
++  }
+   std::string escaped_url_string = base::EscapeExternalHandlerValue(url.spec());
+   GURL escaped_url(escaped_url_string);
+ 
+diff --git a/chrome/browser/flag-metadata.json b/chrome/browser/flag-metadata.json
+index 2e0f7cc..3ed6fb6 100644
+--- a/chrome/browser/flag-metadata.json
++++ b/chrome/browser/flag-metadata.json
+@@ -6590,7 +6590,7 @@
+   {
+     "name": "media-route-dial-provider",
+     "owners": [ "sunggch@microsoft.com" ],
+-    "expiry_milestone": 124
++    "expiry_milestone": -1
+   },
+   {
+     "name": "media-router-cast-allow-all-ips",
+diff --git a/chrome/browser/obsolete_system/obsolete_system_win.cc b/chrome/browser/obsolete_system/obsolete_system_win.cc
+index 689026a..60231c2 100644
+--- a/chrome/browser/obsolete_system/obsolete_system_win.cc
++++ b/chrome/browser/obsolete_system/obsolete_system_win.cc
+@@ -22,16 +22,13 @@ base::win::Version GetRealOSVersion() {
+   return base::win::OSInfo::Kernel32Version();
+ }
+ 
+-bool IsObsoleteOsVersion() {
+-  return GetRealOSVersion() < base::win::Version::WIN10;
+-}
+-
+ }  // namespace
+ 
+ namespace ObsoleteSystem {
+ 
+ bool IsObsoleteNowOrSoon() {
+-  return IsObsoleteOsVersion();
++  // Supermium supports these Windows versions, so never warn about them.
++  return false;
+ }
+ 
+ std::u16string LocalizedObsoleteString() {
+@@ -52,7 +49,7 @@ bool IsEndOfTheLine() {
+   // M109 was the last milestone to support Win 7/8/8.1, the last deprecated
+   // Windows version. Future deprecations should update this to the last
+   // milestone that supports the soon-to-be-deprecated Windows version.
+-  return CHROME_VERSION_MAJOR >= 109;
++  return false;
+ }
+ 
+ const char* GetLinkURL() {
+diff --git a/chrome/browser/profiles/profile_destroyer.cc b/chrome/browser/profiles/profile_destroyer.cc
+index d08378d..0497cfa 100644
+--- a/chrome/browser/profiles/profile_destroyer.cc
++++ b/chrome/browser/profiles/profile_destroyer.cc
+@@ -375,8 +375,12 @@ ProfileDestroyer::~ProfileDestroyer() {
+                                 : ProfileDestructionType::kDelayed);
+   // If this is crashing, a renderer process host is not destroyed fast enough
+   // during shutdown of the browser and deletion of the profile.
+-  CHECK(!observations_.IsObservingAnySource())
+-      << "Some render process hosts were not destroyed early enough!";
++  // In --single-process mode the in-process RenderProcessHost is never
++  // destroyed, so it is expected to still be observed here.
++  if (!content::RenderProcessHost::run_renderer_in_process()) {
++    CHECK(!observations_.IsObservingAnySource())
++        << "Some render process hosts were not destroyed early enough!";
++  }
+   auto iter = PendingDestroyers().find(this);
+   CHECK(iter != PendingDestroyers().end());
+   PendingDestroyers().erase(iter);
+diff --git a/chrome/browser/profiles/profile_manager.cc b/chrome/browser/profiles/profile_manager.cc
+index 746d4e9..cf62d67 100644
+--- a/chrome/browser/profiles/profile_manager.cc
++++ b/chrome/browser/profiles/profile_manager.cc
+@@ -105,6 +105,7 @@
+ #include "components/sync/base/stop_source.h"
+ #include "content/public/browser/browser_task_traits.h"
+ #include "content/public/browser/browser_thread.h"
++#include "content/public/browser/render_process_host.h"
+ #include "content/public/browser/storage_partition.h"
+ #include "content/public/common/content_switches.h"
+ #include "extensions/buildflags/buildflags.h"
+@@ -478,13 +479,20 @@ ProfileManager::ProfileManager(const base::FilePath& user_data_dir)
+ 
+ ProfileManager::~ProfileManager() {
+   DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
+-  for (auto& observer : observers_) {
+-    observer.OnProfileManagerDestroying();
++  // In --single-process mode the in-process RenderProcessHost outlives the
++  // profiles, so skip the parts of the teardown that expect it to be gone.
++  const bool single_process =
++      content::RenderProcessHost::run_renderer_in_process();
++  if (!single_process) {
++    for (auto& observer : observers_) {
++      observer.OnProfileManagerDestroying();
++    }
+   }
+ 
+   base::UmaHistogramBoolean("Profile.DidDestroyProfileBeforeShutdown",
+                             could_have_destroyed_profile_);
+-  if (base::FeatureList::IsEnabled(features::kDestroyProfileOnBrowserClose)) {
++  if (!single_process &&
++      base::FeatureList::IsEnabled(features::kDestroyProfileOnBrowserClose)) {
+     // Ideally, all the keepalives should've been cleared already. Report
+     // metrics for incorrect usage of ScopedProfileKeepAlive.
+     for (const auto& path_and_profile_info : profiles_info_) {
+@@ -508,7 +516,9 @@ ProfileManager::~ProfileManager() {
+   // when the profiles are deleted through `profile_info_.clear()`.
+   profiles_pending_destruction_.clear();
+   profiles_info_.clear();
+-  ProfileDestroyer::DestroyPendingProfilesForShutdown();
++  if (!single_process) {
++    ProfileDestroyer::DestroyPendingProfilesForShutdown();
++  }
+ }
+ 
+ #if BUILDFLAG(ENABLE_SESSION_SERVICE)
+diff --git a/chrome/browser/shell_integration.cc b/chrome/browser/shell_integration.cc
+index 1086dc1..13b7b42 100644
+--- a/chrome/browser/shell_integration.cc
++++ b/chrome/browser/shell_integration.cc
+@@ -314,11 +314,17 @@ void DefaultBrowserWorker::SetAsDefaultImpl(
+       case SET_DEFAULT_INTERACTIVE:
+ #if BUILDFLAG(IS_WIN)
+         if (interactive_permitted_) {
+-          win::SetAsDefaultBrowserUsingSystemSettings(
+-              std::move(on_finished_callback));
+-          // Early return because the function above takes care of calling
+-          // `on_finished_callback`.
+-          return;
++          switch (ShellUtil::GetInteractiveSetDefaultMode()) {
++            case ShellUtil::INTENT_PICKER:
++              win::SetAsDefaultBrowserUsingIntentPicker();
++              break;
++            case ShellUtil::SYSTEM_SETTINGS:
++              win::SetAsDefaultBrowserUsingSystemSettings(
++                  std::move(on_finished_callback));
++              // Early return because the function above takes care of calling
++              // `on_finished_callback`.
++              return;
++          }
+         }
+ #endif  // BUILDFLAG(IS_WIN)
+         break;
+@@ -437,11 +443,17 @@ void DefaultSchemeClientWorker::SetAsDefaultImpl(
+     case SET_DEFAULT_INTERACTIVE:
+ #if BUILDFLAG(IS_WIN)
+       if (interactive_permitted_) {
+-        win::SetAsDefaultClientForSchemeUsingSystemSettings(
+-            scheme_, std::move(on_finished_callback));
+-        // Early return because the function above takes care of calling
+-        // `on_finished_callback`.
+-        return;
++        switch (ShellUtil::GetInteractiveSetDefaultMode()) {
++          case ShellUtil::INTENT_PICKER:
++            win::SetAsDefaultClientForSchemeUsingIntentPicker(scheme_);
++            break;
++          case ShellUtil::SYSTEM_SETTINGS:
++            win::SetAsDefaultClientForSchemeUsingSystemSettings(
++                scheme_, std::move(on_finished_callback));
++            // Early return because the function above takes care of calling
++            // `on_finished_callback`.
++            return;
++        }
+       }
+ #endif  // BUILDFLAG(IS_WIN)
+       break;
+diff --git a/chrome/browser/shell_integration_win.cc b/chrome/browser/shell_integration_win.cc
+index 6c8d3a4..f2f89a4 100644
+--- a/chrome/browser/shell_integration_win.cc
++++ b/chrome/browser/shell_integration_win.cc
+@@ -39,6 +39,7 @@
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/task/thread_pool.h"
+ #include "base/threading/platform_thread.h"
++#include "base/threading/scoped_blocking_call.h"
+ #include "base/time/time.h"
+ #include "base/timer/timer.h"
+ #include "base/win/registry.h"
+@@ -742,6 +743,24 @@ DefaultWebClientSetPermission GetPlatformSpecificDefaultWebClientSetPermission(
+ 
+ namespace win {
+ 
++bool SetAsDefaultBrowserUsingIntentPicker() {
++  base::ScopedBlockingCall scoped_blocking_call(FROM_HERE,
++                                                base::BlockingType::MAY_BLOCK);
++
++  base::FilePath chrome_exe;
++  if (!base::PathService::Get(base::FILE_EXE, &chrome_exe)) {
++    NOTREACHED() << "Error getting app exe path";
++  }
++
++  if (!ShellUtil::ShowMakeChromeDefaultSystemUI(chrome_exe)) {
++    LOG(ERROR) << "Failed to launch the set-default-browser Windows UI.";
++    return false;
++  }
++
++  VLOG(1) << "Set-default-browser Windows UI completed.";
++  return true;
++}
++
+ void SetAsDefaultBrowserUsingSystemSettings(
+     base::OnceClosure on_finished_callback) {
+   base::FilePath chrome_exe;
+@@ -765,6 +784,26 @@ void SetAsDefaultBrowserUsingSystemSettings(
+                                std::move(on_finished_callback)));
+ }
+ 
++bool SetAsDefaultClientForSchemeUsingIntentPicker(const std::string& scheme) {
++  base::ScopedBlockingCall scoped_blocking_call(FROM_HERE,
++                                                base::BlockingType::MAY_BLOCK);
++
++  base::FilePath chrome_exe;
++  if (!base::PathService::Get(base::FILE_EXE, &chrome_exe)) {
++    NOTREACHED() << "Error getting app exe path";
++  }
++
++  std::wstring wscheme(base::UTF8ToWide(scheme));
++  if (!ShellUtil::ShowMakeChromeDefaultProtocolClientSystemUI(chrome_exe,
++                                                              wscheme)) {
++    LOG(ERROR) << "Failed to launch the set-default-client Windows UI.";
++    return false;
++  }
++
++  VLOG(1) << "Set-default-client Windows UI completed.";
++  return true;
++}
++
+ void SetAsDefaultClientForSchemeUsingSystemSettings(
+     const std::string& scheme,
+     base::OnceClosure on_finished_callback) {
+diff --git a/chrome/browser/shell_integration_win.h b/chrome/browser/shell_integration_win.h
+index b638987..4496e63 100644
+--- a/chrome/browser/shell_integration_win.h
++++ b/chrome/browser/shell_integration_win.h
+@@ -19,12 +19,28 @@ enum class ShortcutOperation;
+ 
+ namespace shell_integration::win {
+ 
++// Initiates an OS shell flow which (if followed by the user) should set
++// Chrome as the default browser. Returns false if the flow cannot be
++// initialized, if it is not supported or if the user cancels the operation.
++// Used before Windows 10. This is a blocking call and must run on a
++// MayBlock COM STA sequence. If Chrome is already default browser, no
++// interactive dialog will be shown and this method returns true.
++bool SetAsDefaultBrowserUsingIntentPicker();
++
+ // Initiates the interaction with the system settings for the default browser.
+ // The function takes care of making sure |on_finished_callback| will get called
+ // exactly once when the interaction is finished.
+ void SetAsDefaultBrowserUsingSystemSettings(
+     base::OnceClosure on_finished_callback);
+ 
++// Initiates an OS shell flow which (if followed by the user) should set
++// Chrome as the default handler for |scheme|. Returns false if the flow
++// cannot be initialized, if it is not supported or if the user cancels the
++// operation. Used before Windows 10. This is a blocking call and must run on a
++// MayBlock COM STA sequence. If Chrome is already default for |scheme|, no
++// interactive dialog will be shown and this method returns true.
++bool SetAsDefaultClientForSchemeUsingIntentPicker(const std::string& scheme);
++
+ // Initiates the interaction with the system settings for the default handler of
+ // |scheme|. The function takes care of making sure |on_finished_callback|
+ // will get called exactly once when the interaction is finished.
+diff --git a/chrome/browser/supermium_flag_entries.h b/chrome/browser/supermium_flag_entries.h
+index 5e56fd7..d7e646f 100644
+--- a/chrome/browser/supermium_flag_entries.h
++++ b/chrome/browser/supermium_flag_entries.h
+@@ -31,6 +31,10 @@
+      "Windows 11 Mica Taskbar",
+      "Enables support for the Windows 11 Mica Taskbar, as used in 22H2 and up.",
+      kOsWin, SINGLE_VALUE_TYPE("windows11-mica-titlebar")},
++    {"legacy-tooltips-win",
++     "Legacy tooltips for Windows",
++     "Force the use of native legacy tooltips on Windows 8 and up.",
++     kOsWin, SINGLE_VALUE_TYPE("legacy-tooltips-win")},
+     {"disable-encryption",
+      "Disable encryption",
+      "Disable encryption of cookies, passwords, and settings which uses a generated machine-specific encryption key.  This is used to enable portable user data directories.  ungoogled-chromium flag.",
+@@ -64,6 +68,10 @@
+      "Custom New Tab Page",
+      "Allows setting a custom URL for the new tab page. Value can be internal (e.g. `about:blank` or `chrome://new-tab-page`), external (e.g. `example.com`), or local (e.g. `file:///tmp/startpage.html`). This applies for incognito windows as well when not set to a `chrome://` internal page. ungoogled-chromium flag",
+      kOsDesktop, STRING_VALUE_TYPE("custom-ntp", "")},
++    {"remove-grab-handle",
++     "Remove Grab Handle",
++     "Removes the reserved empty space in the tabstrip for moving the window. ungoogled-chromium flag",
++     kOsDesktop, SINGLE_VALUE_TYPE("remove-grab-handle")},
+     {"omnibox-autocomplete-filtering",
+      "Omnibox Autocomplete Filtering",
+      "Restrict omnibox autocomplete results to a combination of search suggestions (if enabled), bookmarks, and internal chrome pages. ungoogled-chromium flag.",
+@@ -156,6 +164,10 @@
+      "Classic Omnibox Border",
+      "Changes the omnibox outline to have dark borders, to more closely match the classic M49 appearance.",
+      kOsDesktop, SINGLE_VALUE_TYPE("classic-omnibox-border")},
++    {"old-tab-strip-bounds",
++     "Enable Old Tab Strip Bounds",
++     "Enable the old tab strip bounds, specifically on the left (or right in an RTL configuration).",
++     kOsDesktop, SINGLE_VALUE_TYPE("old-tab-strip-bounds")},
+     {"revert-from-portable",
+      "Prevent Data (Extension) Loss When Changing Profile State",
+      "When moving a Supermium profile from one drive to another (one system to another), enable this flag before moving the profile. It can also be "
+diff --git a/chrome/browser/ui/layout_constants.cc b/chrome/browser/ui/layout_constants.cc
+index 73204bb..95afebb 100644
+--- a/chrome/browser/ui/layout_constants.cc
++++ b/chrome/browser/ui/layout_constants.cc
+@@ -144,8 +144,12 @@ void SetLayoutConstantsFallback() {
+     } else {
+         layout_constant_values[(int)LayoutConstant::kTabWidth] = 240;     
+     }
+-    layout_constant_values[(int)LayoutConstant::kTabHorizontalPadding] = 8;
+-    layout_constant_values[(int)LayoutConstant::kTabVerticalPadding] = 6;
++    // Supermium 144 read these two in tab_style.cc into namespace-scope ints
++    // during static initialization, before the values were set, so its tabs
++    // were always laid out with 0. kTabFaviconXOffset and
++    // kTabCloseButtonXOffset (see Tab::Layout()) were tuned for that.
++    layout_constant_values[(int)LayoutConstant::kTabHorizontalPadding] = 0;
++    layout_constant_values[(int)LayoutConstant::kTabVerticalPadding] = 0;
+     layout_constant_values[(int)LayoutConstant::kTabTopCornerRadius] = 10;
+     layout_constant_values[(int)LayoutConstant::kTabBottomCornerRadius] = 12;
+     layout_constant_values[(int)LayoutConstant::kTabStripMaximizedAntiPadding] = 4;
+diff --git a/chrome/browser/ui/tabs/features.cc b/chrome/browser/ui/tabs/features.cc
+index df3758a..8c3218c 100644
+--- a/chrome/browser/ui/tabs/features.cc
++++ b/chrome/browser/ui/tabs/features.cc
+@@ -93,7 +93,11 @@ BASE_FEATURE_PARAM(base::TimeDelta,
+ 
+ BASE_FEATURE(kTabSelectionByPointer, base::FEATURE_ENABLED_BY_DEFAULT);
+ 
+-BASE_FEATURE(kHorizontalTabStripComboButton, base::FEATURE_ENABLED_BY_DEFAULT);
++// Supermium: off by default, so the horizontal tab strip uses the standalone
++// Tab Search button as in Supermium 144: on the right by default, on the left
++// with --tab-strip-control-button-left (see GetDefaultTabSearchRightAligned()).
++// The combo button puts Tab Search on the left unconditionally.
++BASE_FEATURE(kHorizontalTabStripComboButton, base::FEATURE_DISABLED_BY_DEFAULT);
+ BASE_FEATURE_PARAM(bool,
+                    kHorizontalTabStripComboButtonShowStartOnly,
+                    &kHorizontalTabStripComboButton,
+diff --git a/chrome/browser/ui/views/bookmarks/bookmark_button.cc b/chrome/browser/ui/views/bookmarks/bookmark_button.cc
+index a0b3e6f..d5eb9a2 100644
+--- a/chrome/browser/ui/views/bookmarks/bookmark_button.cc
++++ b/chrome/browser/ui/views/bookmarks/bookmark_button.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <string_view>
+ 
++#include "base/command_line.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "chrome/browser/browser_features.h"
+ #include "chrome/browser/predictors/loading_predictor.h"
+@@ -68,6 +69,11 @@ BookmarkButtonBase::BookmarkButtonBase(PressedCallback callback,
+   SetFocusBehavior(FocusBehavior::ACCESSIBLE_ONLY);
+   views::FocusRing::Get(this)->SetOutsetFocusRingDisabled(true);
+ 
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "chrome-refresh-2023-top-chrome-font")) {
++    label()->SetTextStyle(views::style::STYLE_BODY_4_EMPHASIS);
++  }
++
+   show_animation_ = std::make_unique<gfx::SlideAnimation>(this);
+   if (!BookmarkBarView::GetAnimationsEnabled()) {
+     // For some reason during testing the events generated by animating
+diff --git a/chrome/browser/ui/views/bookmarks/bookmark_menu_delegate.cc b/chrome/browser/ui/views/bookmarks/bookmark_menu_delegate.cc
+index e5f4cca..e9499e3 100644
+--- a/chrome/browser/ui/views/bookmarks/bookmark_menu_delegate.cc
++++ b/chrome/browser/ui/views/bookmarks/bookmark_menu_delegate.cc
+@@ -7,7 +7,9 @@
+ #include <cstdint>
+ #include <memory>
+ #include <optional>
++#include <string>
+ 
++#include "base/command_line.h"
+ #include "base/containers/fixed_flat_set.h"
+ #include "base/containers/to_vector.h"
+ #include "base/debug/dump_without_crashing.h"
+@@ -457,6 +459,15 @@ void BookmarkMenuDelegate::ExecuteCommand(int id, int mouse_event_flags) {
+   } else if (id == IDC_BOOKMARK_BAR_OPEN_ALL_NEW_TAB_GROUP) {
+     context = bookmarks::OpenAllBookmarksContext::kInGroup;
+     initial_disposition = WindowOpenDisposition::NEW_BACKGROUND_TAB;
++  } else {
++    const std::string open_bookmark_option =
++        base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++            "open-bookmark-option");
++    if (open_bookmark_option == "foreground") {
++      initial_disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
++    } else if (open_bookmark_option == "background") {
++      initial_disposition = WindowOpenDisposition::NEW_BACKGROUND_TAB;
++    }
+   }
+ 
+   RecordBookmarkLaunch(location_,
+diff --git a/chrome/browser/ui/views/extensions/extensions_toolbar_desktop.cc b/chrome/browser/ui/views/extensions/extensions_toolbar_desktop.cc
+index 904f6d1..7c26207 100644
+--- a/chrome/browser/ui/views/extensions/extensions_toolbar_desktop.cc
++++ b/chrome/browser/ui/views/extensions/extensions_toolbar_desktop.cc
+@@ -42,6 +42,7 @@
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/toolbar_button_provider.h"
+ #include "chrome/browser/ui/views/side_panel/extensions/extension_side_panel_coordinator.h"
++#include "chrome/browser/ui/views/toolbar/app_menu_control.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_action_hover_card_controller.h"
+ #include "chrome/common/pref_names.h"
+ #include "chrome/grit/generated_resources.h"
+@@ -469,6 +470,25 @@ void ExtensionsToolbarDesktop::AnchorAndShowWidgetImmediately(
+   widget->widget_delegate()->AsBubbleDialogDelegate()->SetAnchorView(
+       anchor_view && anchor_view->GetVisible() ? anchor_view
+                                                : GetExtensionsButton());
++
++  // The extensions container is hidden with --hide-extensions-menu, so anchor
++  // the widget to the app menu button instead of the hidden extensions button.
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "hide-extensions-menu")) {
++    BrowserView* const browser_view =
++        BrowserView::GetBrowserViewForBrowser(browser_);
++    AppMenuControl* const app_menu_control =
++        browser_view
++            ? browser_view->toolbar_button_provider()->GetAppMenuControl()
++            : nullptr;
++    if (app_menu_control) {
++      views::BubbleAnchor app_menu_anchor = app_menu_control->GetAnchor();
++      if (!app_menu_anchor.IsNull()) {
++        widget->widget_delegate()->AsBubbleDialogDelegate()->SetAnchor(
++            app_menu_anchor);
++      }
++    }
++  }
+   widget->Show();
+ }
+ 
+diff --git a/chrome/browser/ui/views/frame/browser_desktop_window_tree_host_win.cc b/chrome/browser/ui/views/frame/browser_desktop_window_tree_host_win.cc
+index d346e53..abccb33 100644
+--- a/chrome/browser/ui/views/frame/browser_desktop_window_tree_host_win.cc
++++ b/chrome/browser/ui/views/frame/browser_desktop_window_tree_host_win.cc
+@@ -412,7 +412,15 @@ bool BrowserDesktopWindowTreeHostWin::GetDwmFrameInsetsInPixels(
+         display::win::GetScreenWin()
+             ->DIPToClientPoint(GetHWND(), gfx::Point(0, bottom))
+             .y();
+-    *insets = gfx::Insets::TLBR(tabstrip_region_bottom, 0, 0, 0);
++
++    // The 2 px (not DIP) at the inner edges of Win 7 glass are a light and dark
++    // line, so we must inset further to account for those.
++    constexpr int kWin7GlassInset = 2;
++    const int inset = (base::win::GetVersion() < base::win::Version::WIN8)
++                          ? kWin7GlassInset
++                          : 0;
++    *insets = gfx::Insets::TLBR(tabstrip_region_bottom + inset, inset, inset,
++                                inset);
+   }
+   return true;
+ }
+diff --git a/chrome/browser/ui/views/frame/browser_frame_view_win.cc b/chrome/browser/ui/views/frame/browser_frame_view_win.cc
+index f829637..f20e159 100644
+--- a/chrome/browser/ui/views/frame/browser_frame_view_win.cc
++++ b/chrome/browser/ui/views/frame/browser_frame_view_win.cc
+@@ -10,6 +10,7 @@
+ #include <memory>
+ #include <utility>
+ 
++#include "base/command_line.h"
+ #include "base/memory/raw_ref.h"
+ #include "base/scoped_observation.h"
+ #include "base/trace_event/common/trace_event_common.h"
+@@ -221,6 +222,24 @@ BrowserLayoutParams BrowserFrameViewWin::GetBrowserLayoutParams() const {
+       }
+     }
+   }
++
++  // --old-tab-strip-bounds: start the horizontal tab strip of a tabbed browser
++  // window 8 DIP from the leading edge of the frame. The tab strip is placed
++  // after the leading exclusion's content (plus any padding the tab strip's
++  // leading margin doesn't absorb), so widen the content to reach x = 8.
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "old-tab-strip-bounds")) {
++    const BrowserView* const browser_view = GetBrowserView();
++    if (browser_view && browser_view->GetIsNormalType() &&
++        browser_view->ShouldDrawTabStrip() &&
++        !browser_view->ShouldDrawVerticalTabStrip()) {
++      constexpr int kOldTabStripLeadingX = 8;
++      params.leading_exclusion.content.set_width(
++          std::max(params.leading_exclusion.content.width(),
++                   static_cast<float>(kOldTabStripLeadingX -
++                                      params.visual_client_area.x())));
++    }
++  }
+   return params;
+ }
+ 
+diff --git a/chrome/browser/ui/views/frame/browser_view.cc b/chrome/browser/ui/views/frame/browser_view.cc
+index 4019e26..8c154e4 100644
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -1317,6 +1317,12 @@ bool BrowserView::ShouldDrawTabStrokes() const {
+     return false;
+   }
+ 
++  // Tabs with a hard border (--supermium-tab-options=v60 or rectangular)
++  // always get the active tab stroke and the toolbar top separator.
++  if (GetLayoutConstant(LayoutConstant::kTabHardBorder)) {
++    return true;
++  }
++
+   bool using_system_theme = false;
+   if (GetProfile()) {
+     auto* theme_service = ThemeServiceFactory::GetForProfile(GetProfile());
+@@ -4184,8 +4190,9 @@ void BrowserView::UpdateTabSearchBubbleHost() {
+           combo_button->end_button(), browser_.get());
+       combo_button->SetTabSearchBubbleHost(tab_search_bubble_host_.get());
+     }
+-  } else if (tabs::GetTabSearchPosition(browser_) ==
+-             tabs::TabSearchPosition::kToolbarButton) {
++  } else if (!remove_tab_search_button &&
++             tabs::GetTabSearchPosition(browser_) ==
++                 tabs::TabSearchPosition::kToolbarButton) {
+     tab_search_bubble_host_ = std::make_unique<TabSearchBubbleHost>(
+         toolbar_->tab_search_button(), browser_.get());
+     auto* toolbar_button_controller =
+diff --git a/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc b/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
+index 0a1124e..c8904a0 100644
+--- a/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/horizontal_tab_strip_region_view.cc
+@@ -111,6 +111,10 @@ class FrameGrabHandle : public views::View {
+     // Reserve some space for the frame to be grabbed by, even if the tabstrip
+     // is full.
+     // TODO(tbergquist): Define this relative to the NTB insets again.
++    if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++            "remove-grab-handle")) {
++      return gfx::Size();
++    }
+     return gfx::Size(42, 0);
+   }
+ 
+diff --git a/chrome/browser/ui/views/frame/opaque_browser_frame_view.cc b/chrome/browser/ui/views/frame/opaque_browser_frame_view.cc
+index be7c8cc..e574d03 100644
+--- a/chrome/browser/ui/views/frame/opaque_browser_frame_view.cc
++++ b/chrome/browser/ui/views/frame/opaque_browser_frame_view.cc
+@@ -7,6 +7,7 @@
+ #include <algorithm>
+ #include <utility>
+ 
++#include "base/command_line.h"
+ #include "base/trace_event/trace_event.h"
+ #include "build/build_config.h"
+ #include "build/buildflag.h"
+@@ -263,6 +264,24 @@ void OpaqueBrowserFrameView::InitViews() {
+ BrowserLayoutParams OpaqueBrowserFrameView::GetBrowserLayoutParams() const {
+   BrowserLayoutParams params = BrowserFrameView::GetBrowserLayoutParams();
+   MaybeAddAppIconToLayoutParams(params);
++
++  // --old-tab-strip-bounds: start the horizontal tab strip of a tabbed browser
++  // window 8 DIP from the leading edge of the frame. The tab strip is placed
++  // after the leading exclusion, so widen it (it is empty unless there are
++  // leading caption buttons).
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "old-tab-strip-bounds")) {
++    const BrowserView* const browser_view = GetBrowserView();
++    if (browser_view && browser_view->GetIsNormalType() &&
++        browser_view->ShouldDrawTabStrip() &&
++        !browser_view->ShouldDrawVerticalTabStrip()) {
++      constexpr int kOldTabStripLeadingX = 8;
++      params.leading_exclusion.content.set_width(
++          std::max(params.leading_exclusion.content.width(),
++                   static_cast<float>(kOldTabStripLeadingX -
++                                      params.visual_client_area.x())));
++    }
++  }
+   return params;
+ }
+ 
+diff --git a/chrome/browser/ui/views/location_bar/location_bar_view.cc b/chrome/browser/ui/views/location_bar/location_bar_view.cc
+index 1ed6778..885cfa8 100644
+--- a/chrome/browser/ui/views/location_bar/location_bar_view.cc
++++ b/chrome/browser/ui/views/location_bar/location_bar_view.cc
+@@ -263,7 +263,9 @@ LocationBarView::LocationBarView(Browser* browser,
+                  !v->GetOmniboxController()->IsPopupOpen();
+         }));
+     views::FocusRing::Get(this)->SetOutsetFocusRingDisabled(true);
+-    views::InstallPillHighlightPathGenerator(this);
++    if (!base::CommandLine::ForCurrentProcess()->HasSwitch("classic-omnibox")) {
++      views::InstallPillHighlightPathGenerator(this);
++    }
+ 
+ #if BUILDFLAG(OS_LEVEL_GEOLOCATION_PERMISSION_SUPPORTED)
+     if (features::IsOsLevelGeolocationPermissionSupportEnabled()) {
+@@ -633,6 +635,9 @@ int LocationBarView::GetBorderRadius() const {
+ 
+ // static
+ int LocationBarView::ComputeBorderRadius(gfx::Size size) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("classic-omnibox")) {
++    return 3;
++  }
+   return ChromeLayoutProvider::Get()->GetCornerRadiusMetric(
+       views::Emphasis::kMaximum, size);
+ }
+diff --git a/chrome/browser/ui/views/tabs/new_tab_button.cc b/chrome/browser/ui/views/tabs/new_tab_button.cc
+index a068dc0..6e85de7 100644
+--- a/chrome/browser/ui/views/tabs/new_tab_button.cc
++++ b/chrome/browser/ui/views/tabs/new_tab_button.cc
+@@ -5,26 +5,52 @@
+ #include "chrome/browser/ui/views/tabs/new_tab_button.h"
+ 
+ #include <memory>
++#include <optional>
+ #include <string>
+ 
++#include "base/check.h"
++#include "base/command_line.h"
+ #include "base/metrics/user_metrics.h"
+ #include "base/strings/string_number_conversions.h"
++#include "cc/paint/paint_flags.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/split_tab_metrics.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/ui_features.h"
++#include "chrome/browser/ui/views/frame/browser_frame_view.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/frame/browser_widget.h"
++#include "chrome/browser/ui/views/frame/themed_background.h"
+ #include "chrome/browser/ui/views/tabs/tab_strip.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/tabs/public/tab_group.h"
++#include "third_party/skia/include/core/SkColor.h"
++#include "third_party/skia/include/core/SkPath.h"
++#include "third_party/skia/include/core/SkPoint.h"
+ #include "ui/base/interaction/element_identifier.h"
+ #include "ui/base/l10n/l10n_util.h"
++#include "ui/base/models/image_model.h"
++#include "ui/base/pointer/touch_ui_controller.h"
++#include "ui/base/theme_provider.h"
+ #include "ui/base/ui_base_features.h"
++#include "ui/color/color_provider.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/geometry/point_f.h"
++#include "ui/gfx/geometry/vector2d.h"
++#include "ui/gfx/image/image_skia.h"
++#include "ui/gfx/scoped_canvas.h"
++#include "ui/views/animation/ink_drop.h"
++#include "ui/views/animation/ink_drop_host.h"
++#include "ui/views/background.h"
++#include "ui/views/controls/highlight_path_generator.h"
+ #include "ui/views/view_class_properties.h"
++#include "ui/views/widget/widget.h"
+ 
+ DEFINE_CLASS_ELEMENT_IDENTIFIER_VALUE(NewTabButtonMenuModel, kNewTab);
+ DEFINE_CLASS_ELEMENT_IDENTIFIER_VALUE(NewTabButtonMenuModel, kNewTabInGroup);
+@@ -32,6 +58,72 @@ DEFINE_CLASS_ELEMENT_IDENTIFIER_VALUE(NewTabButtonMenuModel, kNewSplitView);
+ DEFINE_CLASS_ELEMENT_IDENTIFIER_VALUE(NewTabButtonMenuModel,
+                                       kCreateNewTabGroup);
+ 
++namespace {
++
++// --supermium-tab-options=v60 and =rectangular draw the new tab button as a
++// trapezoid or a rectangle without a '+' glyph.
++bool UseClassicShapeWithoutIcon() {
++  const std::string tab_options =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++          "supermium-tab-options");
++  return tab_options == "v60" || tab_options == "rectangular";
++}
++
++// The Supermium tab styles and options that change the new tab button get the
++// classic (pre-2023) button that Supermium 144 painted itself.
++bool UseClassicNewTabButton() {
++  const base::CommandLine* const command_line =
++      base::CommandLine::ForCurrentProcess();
++  return UseClassicShapeWithoutIcon() ||
++         command_line->HasSwitch("compact-tab-ui") ||
++         command_line->HasSwitch("transparent-tabs") ||
++         GetLayoutConstant(LayoutConstant::kTabHardBorder);
++}
++
++// Returns the shape of the classic new tab button, relative to the origin of
++// the button's contents bounds. `corner_radius` is the radius of the default
++// (circular) shape.
++SkPath GetClassicBorderPath(int corner_radius) {
++  const std::string tab_options =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++          "supermium-tab-options");
++  if (tab_options == "v60") {
++    static constexpr SkPoint kPoints[] = {
++        {4.0f, 8.0f}, {24.0f, 8.0f}, {28.0f, 20.0f}, {8.0f, 20.0f}};
++    return SkPath::Polygon(kPoints, /*isClosed=*/true);
++  }
++  if (tab_options == "rectangular") {
++    static constexpr SkPoint kPoints[] = {
++        {8.0f, 8.0f}, {32.0f, 8.0f}, {32.0f, 20.0f}, {8.0f, 20.0f}};
++    return SkPath::Polygon(kPoints, /*isClosed=*/true);
++  }
++
++  float radius = static_cast<float>(corner_radius);
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("compact-tab-ui")) {
++    radius -= 2;
++  }
++  return SkPath::Circle(radius, radius, radius);
++}
++
++// Makes the ink drop highlight and the focus ring follow the classic shape.
++class ClassicHighlightPathGenerator : public views::HighlightPathGenerator {
++ public:
++  ClassicHighlightPathGenerator() = default;
++  ClassicHighlightPathGenerator(const ClassicHighlightPathGenerator&) = delete;
++  ClassicHighlightPathGenerator& operator=(
++      const ClassicHighlightPathGenerator&) = delete;
++
++  // views::HighlightPathGenerator:
++  SkPath GetHighlightPath(const views::View* view) override {
++    const gfx::Vector2d offset = view->GetContentsBounds().OffsetFromOrigin();
++    return GetClassicBorderPath(
++               static_cast<const NewTabButton*>(view)->GetCornerRadius())
++        .makeOffset(offset.x(), offset.y());
++  }
++};
++
++}  // namespace
++
+ NewTabButton::NewTabButton(PressedCallback callback,
+                            const gfx::VectorIcon& icon,
+                            Edge fixed_flat_edge,
+@@ -45,6 +137,17 @@ NewTabButton::NewTabButton(PressedCallback callback,
+       browser_(browser) {
+   set_context_menu_controller(this);
+   SetProperty(views::kElementIdentifierKey, kNewTabButtonElementId);
++
++  if (UseClassicNewTabButton()) {
++    views::HighlightPathGenerator::Install(
++        this, std::make_unique<ClassicHighlightPathGenerator>());
++    if (UseClassicShapeWithoutIcon()) {
++      views::InkDrop::Get(this)->SetMode(views::InkDropHost::InkDropMode::OFF);
++    }
++    // TabStripControlButton's constructor set the vector icon; the classic
++    // button paints its '+' in PaintButtonContents().
++    UpdateIcon();
++  }
+ }
+ 
+ NewTabButton::~NewTabButton() = default;
+@@ -68,14 +171,143 @@ void NewTabButton::ShowContextMenuForViewImpl(
+   }
+ }
+ 
++void NewTabButton::UpdateIcon() {
++  if (!UseClassicNewTabButton()) {
++    TabStripControlButton::UpdateIcon();
++    return;
++  }
++  // The classic button has no image; PaintButtonContents() draws its '+'.
++  SetImageModel(views::Button::STATE_NORMAL, ui::ImageModel());
++  SetImageModel(views::Button::STATE_HOVERED, ui::ImageModel());
++  SetImageModel(views::Button::STATE_PRESSED, ui::ImageModel());
++}
++
++bool NewTabButton::GetHitTestMask(SkPath* mask) const {
++  if (!UseClassicNewTabButton()) {
++    return TabStripControlButton::GetHitTestMask(mask);
++  }
++  CHECK(mask);
++  const gfx::Vector2d offset = GetContentsBounds().OffsetFromOrigin();
++  *mask = GetClassicBorderPath(GetCornerRadius())
++              .makeOffset(offset.x(), offset.y());
++  return true;
++}
++
+ void NewTabButton::UpdateBackground() {
+   if (features::IsGlassFrameEnabled()) {
+     SetBackground(views::CreateSolidBackground(SK_ColorTRANSPARENT));
+     return;
+   }
++  if (UseClassicNewTabButton()) {
++    // The classic button is painted by OnPaintBackground().
++    SetBackground(nullptr);
++    SchedulePaint();
++    return;
++  }
+   TabStripControlButton::UpdateBackground();
+ }
+ 
++void NewTabButton::OnPaintBackground(gfx::Canvas* canvas) {
++  if (features::IsGlassFrameEnabled() || !UseClassicNewTabButton()) {
++    TabStripControlButton::OnPaintBackground(canvas);
++    return;
++  }
++
++  gfx::ScopedCanvas scoped_canvas(canvas);
++  const SkPath border_path = GetClassicBorderPath(GetCornerRadius());
++  const gfx::Vector2d contents_offset = GetContentsBounds().OffsetFromOrigin();
++
++  BrowserView* const browser_view =
++      browser_ ? BrowserView::GetBrowserViewForBrowser(browser_.get())
++               : nullptr;
++  const BrowserFrameView* const frame_view =
++      browser_view ? browser_view->browser_widget()->GetFrameView() : nullptr;
++  const std::optional<int> bg_id =
++      frame_view ? frame_view->GetCustomBackgroundId(
++                       BrowserFrameActiveState::kUseCurrent)
++                 : std::nullopt;
++  gfx::ImageSkia* const theme_image =
++      (bg_id.has_value() && GetThemeProvider())
++          ? GetThemeProvider()->GetImageSkiaNamed(bg_id.value())
++          : nullptr;
++  if (theme_image) {
++    // The shape of the background texture is defined by a clip path, which
++    // is translated to the contents bounds. The image itself must not be
++    // translated, so that it aligns with the same image painted elsewhere.
++    canvas->ClipPath(
++        border_path.makeOffset(contents_offset.x(), contents_offset.y()),
++        /*do_anti_alias=*/true);
++    ThemedBackground::PaintThemeAlignedImage(canvas, this, browser_view,
++                                             theme_image);
++    return;
++  }
++
++  // Without a theme image, draw a solid color button.
++  cc::PaintFlags flags;
++  flags.setAntiAlias(true);
++  canvas->Translate(contents_offset);
++
++  if (GetState() == STATE_HOVERED) {
++    flags.setColor(SkColorSetARGB(0x80, 90, 90, 90));
++  } else {
++    // v60 and rectangular tabs swap the active and inactive frame colors.
++    const bool paint_as_active = GetWidget()->ShouldPaintAsActive();
++    const bool use_active_color =
++        UseClassicShapeWithoutIcon() ? !paint_as_active : paint_as_active;
++    flags.setColor(GetColorProvider()->GetColor(
++        use_active_color ? kColorNewTabButtonBackgroundFrameActive
++                         : kColorNewTabButtonBackgroundFrameInactive));
++  }
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("transparent-tabs")) {
++    flags.setAlphaf(0.7f);
++  }
++  canvas->DrawPath(border_path, flags);
++
++  if (GetLayoutConstant(LayoutConstant::kTabHardBorder)) {
++    flags.setColor(SK_ColorBLACK);
++    flags.setAlphaf(0.7f);
++    flags.setStyle(cc::PaintFlags::kStroke_Style);
++    canvas->DrawPath(border_path, flags);
++  }
++}
++
++void NewTabButton::PaintButtonContents(gfx::Canvas* canvas) {
++  TabStripControlButton::PaintButtonContents(canvas);
++  if (!UseClassicNewTabButton() || UseClassicShapeWithoutIcon()) {
++    return;
++  }
++
++  // Draw the classic '+' glyph, centered in the circle.
++  gfx::ScopedCanvas scoped_canvas(canvas);
++  canvas->Translate(GetContentsBounds().OffsetFromOrigin());
++  cc::PaintFlags flags;
++  flags.setAntiAlias(true);
++  flags.setColor(GetColorProvider()->GetColor(
++      GetWidget()->ShouldPaintAsActive()
++          ? kColorNewTabButtonForegroundFrameActive
++          : kColorNewTabButtonForegroundFrameInactive));
++  flags.setStrokeCap(cc::PaintFlags::kRound_Cap);
++  constexpr int kStrokeWidth = 2;
++  flags.setStrokeWidth(kStrokeWidth);
++
++  int radius = ui::TouchUiController::Get()->touch_ui() ? 7 : 6;
++  const int offset = GetCornerRadius() - radius;
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("compact-tab-ui")) {
++    radius -= 2;
++  }
++  // The cap will be added outside the end of the stroke; inset to compensate.
++  constexpr int kCapRadius = kStrokeWidth / 2;
++  const int start = offset + kCapRadius;
++  const int end = offset + (radius * 2) - kCapRadius;
++  const int center = offset + radius;
++
++  // Horizontal stroke.
++  canvas->DrawLine(gfx::PointF(start, center), gfx::PointF(end, center), flags);
++
++  // Vertical stroke.
++  canvas->DrawLine(gfx::PointF(center, start), gfx::PointF(center, end), flags);
++}
++
+ NewTabButtonMenuModel::NewTabButtonMenuModel(BrowserWindowInterface* browser)
+     : ui::SimpleMenuModel(this), browser_(browser) {
+   CHECK(browser_);
+diff --git a/chrome/browser/ui/views/tabs/new_tab_button.h b/chrome/browser/ui/views/tabs/new_tab_button.h
+index 7eb01ec..887048d 100644
+--- a/chrome/browser/ui/views/tabs/new_tab_button.h
++++ b/chrome/browser/ui/views/tabs/new_tab_button.h
+@@ -15,6 +15,12 @@
+ #include "ui/views/controls/menu/menu_runner.h"
+ #include "ui/views/view.h"
+ 
++class SkPath;
++
++namespace gfx {
++class Canvas;
++}
++
+ namespace views {
+ class MenuRunner;
+ }
+@@ -43,10 +49,20 @@ class NewTabButton : public TabStripControlButton,
+       const gfx::Point& point,
+       ui::mojom::MenuSourceType source_type) override;
+ 
++  // TabStripControlButton:
++  void UpdateIcon() override;
++  bool GetHitTestMask(SkPath* mask) const override;
++
+  protected:
+   // TabStripControlButton:
+   void UpdateBackground() override;
+ 
++  // views::View:
++  void OnPaintBackground(gfx::Canvas* canvas) override;
++
++  // views::Button:
++  void PaintButtonContents(gfx::Canvas* canvas) override;
++
+  private:
+   std::unique_ptr<NewTabButtonMenuModel> context_menu_model_;
+   std::unique_ptr<views::MenuRunner> context_menu_runner_;
+diff --git a/chrome/browser/ui/views/toolbar/toolbar_view.cc b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+index e37ae1a..e02fee3 100644
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -502,7 +502,9 @@ void ToolbarView::Init() {
+   }
+ 
+   if (!base::FeatureList::IsEnabled(tabs::kHorizontalTabStripComboButton) &&
+-      features::HasTabSearchToolbarButton()) {
++      features::HasTabSearchToolbarButton() &&
++      !base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "remove-tabsearch-button")) {
+     CHECK(!features::IsWebUIPinnedToolbarActionsEnabled())
+         << "WebUIPinnedToolbarActions does not support "
+            "CreatePermanentButtonFor, consider enabling "
+diff --git a/chrome/browser/ui/webui/settings/settings_utils_win.cc b/chrome/browser/ui/webui/settings/settings_utils_win.cc
+index adfc01c..b2c918d 100644
+--- a/chrome/browser/ui/webui/settings/settings_utils_win.cc
++++ b/chrome/browser/ui/webui/settings/settings_utils_win.cc
+@@ -16,6 +16,7 @@
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/task/thread_pool.h"
+ #include "base/threading/thread.h"
++#include "base/win/windows_version.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/platform_util.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -103,9 +104,17 @@ void OpenConnectionDialogCallback() {
+ }
+ 
+ void ShowNetworkProxySettings(content::WebContents* /*web_contents*/) {
+-  // See
+-  // https://docs.microsoft.com/en-us/windows/uwp/launch-resume/launch-settings-app#network--internet
+-  platform_util::OpenExternal(GURL("ms-settings:network-proxy"));
++  if (base::win::GetVersion() >= base::win::Version::WIN10) {
++    // See
++    // https://docs.microsoft.com/en-us/windows/uwp/launch-resume/launch-settings-app#network--internet
++    platform_util::OpenExternal(GURL("ms-settings:network-proxy"));
++  } else {
++    // ms-settings:network-proxy only exists on Windows 10 and later; open the
++    // Internet Options dialog with the Connections tab selected instead.
++    base::ThreadPool::PostTask(
++        FROM_HERE, {base::TaskPriority::USER_VISIBLE, base::MayBlock()},
++        base::BindOnce(&OpenConnectionDialogCallback));
++  }
+ }
+ 
+ void ShowManageSSLCertificates(content::WebContents* web_contents) {
+diff --git a/chrome/installer/setup/setup_util.cc b/chrome/installer/setup/setup_util.cc
+index 623618d..2285499 100644
+--- a/chrome/installer/setup/setup_util.cc
++++ b/chrome/installer/setup/setup_util.cc
+@@ -246,7 +246,10 @@ bool ContainsUnsupportedSwitch(const base::CommandLine& cmd_line) {
+ }
+ 
+ bool IsProcessorSupported() {
+-#if defined(ARCH_CPU_X86_FAMILY)
++#if defined(ARCH_CPU_X86)
++  // Supermium: the 32-bit build supports SSE2-only processors.
++  return base::CPU().has_sse2();
++#elif defined(ARCH_CPU_X86_FAMILY)
+   return base::CPU().has_sse3();
+ #elif defined(ARCH_CPU_ARM64)
+   return true;
+diff --git a/chrome/installer/util/install_util.cc b/chrome/installer/util/install_util.cc
+index b2ae753..1c28941 100644
+--- a/chrome/installer/util/install_util.cc
++++ b/chrome/installer/util/install_util.cc
+@@ -245,10 +245,10 @@ base::Version InstallUtil::GetCriticalUpdateVersion() {
+ }
+ 
+ bool InstallUtil::IsOSSupported() {
+-  // We do not support anything prior to Windows 10.
++  // We do not support anything prior to Windows Vista.
+   VLOG(1) << base::SysInfo::OperatingSystemName() << ' '
+           << base::SysInfo::OperatingSystemVersion();
+-  return base::win::GetVersion() >= base::win::Version::WIN10;
++  return base::win::GetVersion() >= base::win::Version::VISTA;
+ }
+ 
+ void InstallUtil::AddInstallerResultItems(bool system_install,
+diff --git a/chrome/installer/util/shell_util.cc b/chrome/installer/util/shell_util.cc
+index 149cc04..a9630ec 100644
+--- a/chrome/installer/util/shell_util.cc
++++ b/chrome/installer/util/shell_util.cc
+@@ -15,6 +15,7 @@
+ 
+ #include <shellapi.h>
+ #include <shlobj.h>
++#include <windows.h>
+ #include <wrl/client.h>
+ 
+ #include <algorithm>
+@@ -238,6 +239,11 @@ void GetProgIdEntries(const ShellUtil::ApplicationInfo& app_info,
+   entries->push_back(std::make_unique<RegistryEntry>(
+       prog_id_path + ShellUtil::kRegShellOpen, app_info.command_line));
+ 
++  // The following entries are required as of Windows 8.
++  if (base::win::GetVersion() < base::win::Version::WIN8) {
++    return;
++  }
++
+   // Associate the ProgId with the app's AppUserModelId.
+   if (!app_info.app_id.empty()) {
+     entries->push_back(std::make_unique<RegistryEntry>(
+@@ -699,6 +705,39 @@ bool ElevateAndRegisterChrome(
+   return false;
+ }
+ 
++// Launches the Windows Vista to Windows 8.1 dialog for picking the application
++// to handle the given protocol. Most importantly, this is used to set the
++// default handler for http (and, implicitly with it, https). In that case it is
++// also known as the 'how do you want to open webpages' dialog.
++// It is required that Chrome be already *registered* for the given protocol.
++bool LaunchSelectDefaultProtocolHandlerDialog(const wchar_t* protocol) {
++  DCHECK(protocol);
++  // SHOpenWithDialog() doesn't exist on Windows XP, so look it up at runtime.
++  HMODULE shell32 = ::GetModuleHandleW(L"shell32.dll");
++  if (!shell32) {
++    shell32 = ::LoadLibraryW(L"shell32.dll");
++  }
++  if (!shell32) {
++    return false;
++  }
++  auto* open_with_dialog = reinterpret_cast<decltype(&::SHOpenWithDialog)>(
++      ::GetProcAddress(shell32, "SHOpenWithDialog"));
++  if (!open_with_dialog) {
++    return false;
++  }
++  OPENASINFO open_as_info = {};
++  open_as_info.pcszFile = protocol;
++  open_as_info.oaifInFlags =
++      OAIF_URL_PROTOCOL | OAIF_FORCE_REGISTRATION | OAIF_REGISTER_EXT;
++  HRESULT hr = open_with_dialog(nullptr, &open_as_info);
++  DLOG_IF(WARNING, FAILED(hr)) << "Failed to set as default " << protocol
++                               << " handler; hr=0x" << std::hex << hr;
++  if (FAILED(hr))
++    return false;
++  SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
++  return true;
++}
++
+ // Returns true if |chrome_exe| has been registered with |suffix| for |mode|.
+ // |confirmation_level| is the level of verification desired as described in
+ // the RegistrationConfirmationLevel enum above.
+@@ -732,11 +771,12 @@ bool QuickIsChromeRegisteredForMode(
+   }
+   reg_key += ShellUtil::kRegShellOpen;
+ 
+-  // ProgId and shell integration registrations are allowed to reside in HKCU
+-  // for user-level installs, and values there have priority over values in
+-  // HKLM.
++  // ProgId registrations are allowed to reside in HKCU for user-level installs
++  // (and values there have priority over values in HKLM). The same is true for
++  // shell integration entries as of Windows 8.
+   if (confirmation_level == CONFIRM_PROGID_REGISTRATION ||
+-      confirmation_level == CONFIRM_SHELL_REGISTRATION) {
++      (confirmation_level == CONFIRM_SHELL_REGISTRATION &&
++       base::win::GetVersion() >= base::win::Version::WIN8)) {
+     const RegKey key_hkcu(HKEY_CURRENT_USER, reg_key.c_str(), KEY_QUERY_VALUE);
+     std::wstring hkcu_value;
+     // If |reg_key| is present in HKCU, assert that it points to |chrome_exe|.
+@@ -810,7 +850,9 @@ bool GetInstallationSpecificSuffix(const base::FilePath& chrome_exe,
+ // be placed for this install. As of Windows 8 everything can go in HKCU for
+ // per-user installs.
+ HKEY DetermineRegistrationRoot(bool is_per_user) {
+-  return is_per_user ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE;
++  return is_per_user && base::win::GetVersion() >= base::win::Version::WIN8
++             ? HKEY_CURRENT_USER
++             : HKEY_LOCAL_MACHINE;
+ }
+ 
+ // Associates Chrome with supported protocols and file associations. This should
+@@ -1894,6 +1936,14 @@ bool ShellUtil::LaunchUninstallAppsSettings() {
+   return base::win::LaunchSettingsUri(L"page=SettingsPageAppsSizes");
+ }
+ 
++// static
++ShellUtil::InteractiveSetDefaultMode ShellUtil::GetInteractiveSetDefaultMode() {
++  if (base::win::GetVersion() >= base::win::Version::WIN10)
++    return InteractiveSetDefaultMode::SYSTEM_SETTINGS;
++
++  return InteractiveSetDefaultMode::INTENT_PICKER;
++}
++
+ bool ShellUtil::ShowMakeChromeDefaultSystemUI(
+     const base::FilePath& chrome_exe) {
+   if (!install_static::SupportsSetAsDefaultBrowser())
+@@ -1907,15 +1957,28 @@ bool ShellUtil::ShowMakeChromeDefaultSystemUI(
+   bool is_win11_or_greater =
+       base::win::GetVersion() >= base::win::Version::WIN11;
+   if (!is_default) {
+-    if (is_win11_or_greater) {
+-      // Launch the Windows Apps Settings dialog and navigate to the settings
+-      // page for Chrome.
+-      succeeded = base::win::LaunchSettingsDefaultApps(
+-          GetApplicationName(chrome_exe), InstallUtil::IsPerUserInstall());
+-    }
+-    if (!is_win11_or_greater || !succeeded) {
+-      // Launch the Windows Apps Settings dialog.
+-      succeeded = base::win::LaunchDefaultAppsSettingsModernDialog(L"http");
++    switch (GetInteractiveSetDefaultMode()) {
++      case INTENT_PICKER:
++        // Before Windows 10, the Settings app pages used below don't exist.
++        // What you can do is to launch "Set Program Associations" section of
++        // the "Default Programs" control panel, which is a mess, or pop the
++        // concise "How do you want to open webpages?" dialog. We choose the
++        // latter.
++        succeeded = LaunchSelectDefaultProtocolHandlerDialog(L"http");
++        break;
++      case SYSTEM_SETTINGS:
++        if (is_win11_or_greater) {
++          // Launch the Windows Apps Settings dialog and navigate to the
++          // settings page for Chrome.
++          succeeded = base::win::LaunchSettingsDefaultApps(
++              GetApplicationName(chrome_exe), InstallUtil::IsPerUserInstall());
++        }
++        if (!is_win11_or_greater || !succeeded) {
++          // Launch the Windows Apps Settings dialog.
++          succeeded =
++              base::win::LaunchDefaultAppsSettingsModernDialog(L"http");
++        }
++        break;
+     }
+   }
+   if (succeeded && is_default)
+@@ -1981,9 +2044,18 @@ bool ShellUtil::ShowMakeChromeDefaultProtocolClientSystemUI(
+   bool is_default =
+       (GetChromeDefaultProtocolClientState(protocol) == IS_DEFAULT);
+   if (!is_default) {
+-    // Launch the Windows settings dialog.
+-    succeeded =
+-        base::win::LaunchDefaultAppsSettingsModernDialog(protocol.c_str());
++    switch (GetInteractiveSetDefaultMode()) {
++      case INTENT_PICKER:
++        // Before Windows 10, pop the concise "How do you want to open links of
++        // this type (protocol)?" dialog.
++        succeeded = LaunchSelectDefaultProtocolHandlerDialog(protocol.c_str());
++        break;
++      case SYSTEM_SETTINGS:
++        // Launch the Windows settings dialog.
++        succeeded =
++            base::win::LaunchDefaultAppsSettingsModernDialog(protocol.c_str());
++        break;
++    }
+     is_default = (succeeded &&
+                   GetChromeDefaultProtocolClientState(protocol) == IS_DEFAULT);
+   }
+diff --git a/chrome/installer/util/shell_util.h b/chrome/installer/util/shell_util.h
+index 12c0548..2fbf7c7 100644
+--- a/chrome/installer/util/shell_util.h
++++ b/chrome/installer/util/shell_util.h
+@@ -52,6 +52,20 @@ class ShellUtil {
+     SYSTEM_LEVEL = 0x2   // Make any shell changes only at the system level
+   };
+ 
++  enum InteractiveSetDefaultMode {
++    // The intent picker is opened with the different choices available to the
++    // user.
++    INTENT_PICKER,
++    // The Windows default apps settings page is opened with the current default
++    // app focused.
++    SYSTEM_SETTINGS,
++  };
++
++  // Returns the interactive mode that should be used to set the default browser
++  // or default protocol client: the intent picker before Windows 10, the
++  // system settings on Windows 10 and later.
++  static InteractiveSetDefaultMode GetInteractiveSetDefaultMode();
++
+   // Chrome's default handler state for a given protocol. If the current install
+   // mode is not default, the brand's other modes are checked. This allows
+   // callers to take specific action in case the current mode (e.g., Chrome Dev)
+diff --git a/components/autofill/core/browser/crowdsourcing/autofill_crowdsourcing_manager.cc b/components/autofill/core/browser/crowdsourcing/autofill_crowdsourcing_manager.cc
+index 6b976f4..35ee610 100644
+--- a/components/autofill/core/browser/crowdsourcing/autofill_crowdsourcing_manager.cc
++++ b/components/autofill/core/browser/crowdsourcing/autofill_crowdsourcing_manager.cc
+@@ -946,6 +946,9 @@ bool AutofillCrowdsourcingManager::StartRequest(FormRequestData request_data) {
+       (request_data.request_type == CrowdsourcingRequestType::kRequestUpload) ==
+       !request_data.isolation_info);
+ #endif
++
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return false;
+   // Get the URL and method to use for this request.
+   auto [request_url, method] = GetRequestURLAndMethod(request_data);
+ 
+diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedder_support/user_agent_utils.cc
+index 41d34a2..350773a 100644
+--- a/components/embedder_support/user_agent_utils.cc
++++ b/components/embedder_support/user_agent_utils.cc
+@@ -731,8 +731,14 @@ blink::UserAgentMetadata GetUserAgentMetadata(bool only_low_entropy_ch) {
+   // Low entropy client hints.
+   metadata.brand_version_list =
+       GetUserAgentBrandMajorVersionListInternal(std::nullopt);
+-  metadata.mobile = GetMobileBitForUAMetadata();
+-  metadata.platform = GetPlatformForUAMetadata();
++  // Supermium: the fields of the "uao" file override the client hints, so
++  // that they match the user agent string from the same file.
++  const std::string mobile_custom = parseFile(UACHCustomIsMobile);
++  metadata.mobile = mobile_custom.empty() ? GetMobileBitForUAMetadata()
++                                          : mobile_custom == "true";
++  const std::string platform_custom = parseFile(UACHCustomPlatform);
++  metadata.platform =
++      platform_custom.empty() ? GetPlatformForUAMetadata() : platform_custom;
+ 
+   // For users providing a valid user-agent override via the command line:
+   // If kUACHOverrideBlank is enabled, set user-agent metadata with the
+@@ -754,13 +760,31 @@ blink::UserAgentMetadata GetUserAgentMetadata(bool only_low_entropy_ch) {
+   // High entropy client hints.
+   metadata.brand_full_version_list =
+       GetUserAgentBrandFullVersionListInternal(std::nullopt);
+-  metadata.full_version = std::string(version_info::GetVersionNumber());
+-  metadata.architecture = GetCpuArchitecture();
+-  metadata.model = BuildModelInfo();
++  const std::string full_version_custom = parseFile(UACHCustomFullVersion);
++  metadata.full_version = full_version_custom.empty()
++                              ? std::string(version_info::GetVersionNumber())
++                              : full_version_custom;
++  const std::string architecture_custom = parseFile(UACHCustomArchitecture);
++  metadata.architecture = architecture_custom.empty() ? GetCpuArchitecture()
++                                                      : architecture_custom;
++  const std::string model_custom = parseFile(UACHCustomModel);
++  metadata.model = model_custom.empty() ? BuildModelInfo() : model_custom;
+   metadata.form_factors = GetFormFactorsClientHint(metadata, metadata.mobile);
+-  metadata.bitness = GetCpuBitness();
+-  metadata.wow64 = IsWoW64();
+-  metadata.platform_version = GetPlatformVersion();
++  const std::string bitness_custom = parseFile(UACHCustomBitness);
++  metadata.bitness = bitness_custom.empty() ? GetCpuBitness() : bitness_custom;
++  const std::string wow64_custom = parseFile(UACHCustomWOW64);
++  if (wow64_custom == "true") {
++    metadata.wow64 = true;
++  } else if (wow64_custom == "false") {
++    metadata.wow64 = false;
++  } else {
++    metadata.wow64 = IsWoW64();
++  }
++  const std::string platform_version_custom =
++      parseFile(UACHCustomPlatformVersion);
++  metadata.platform_version = platform_version_custom.empty()
++                                  ? GetPlatformVersion()
++                                  : platform_version_custom;
+   return metadata;
+ }
+ 
+diff --git a/components/error_page/common/localized_error.cc b/components/error_page/common/localized_error.cc
+index 9f261d6..4c2a158 100644
+--- a/components/error_page/common/localized_error.cc
++++ b/components/error_page/common/localized_error.cc
+@@ -647,6 +647,15 @@ void GetSuggestionsSummaryList(int error_code,
+       !failed_url.SchemeIsHTTPOrHTTPS()) {
+     suggestions &= ~SUGGEST_DIAGNOSE_TOOL;
+   }
++
++#if BUILDFLAG(IS_WIN)
++  // Supermium: the Network Diagnostics Framework (ndfapi.dll) does not exist
++  // before Windows Vista.
++  if (base::win::GetVersion() < base::win::Version::VISTA) {
++    suggestions &= ~SUGGEST_DIAGNOSE_TOOL;
++  }
++#endif
++
+   // Remove the captive portal signin suggestion if not in a portal state.
+   if (!error_page_params ||
+       !error_page_params->FindBool(kIsPortalStateKey).value_or(false)) {
+diff --git a/components/google/core/common/google_util.cc b/components/google/core/common/google_util.cc
+index 9988687..94f8cfb 100644
+--- a/components/google/core/common/google_util.cc
++++ b/components/google/core/common/google_util.cc
+@@ -172,11 +172,15 @@ std::string GetGoogleLocale(const std::string& application_locale) {
+ 
+ GURL AppendGoogleLocaleParam(const GURL& url,
+                              const std::string& application_locale) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return url;
+   return net::AppendQueryParameter(url, "hl",
+                                    GetGoogleLocale(application_locale));
+ }
+ 
+ std::string GetGoogleCountryCode(const GURL& google_homepage_url) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return "nolocale";
+   std::string_view google_hostname = google_homepage_url.host();
+   // TODO(igorcov): This needs a fix for case when the host has a trailing dot,
+   // like "google.com./". https://crbug.com/720295.
+@@ -256,12 +260,16 @@ bool IsGoogleDomainUrl(const GURL& url,
+ 
+ bool IsGoogleHostname(std::string_view host,
+                       SubdomainPermission subdomain_permission) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return false;
+   url::CanonHostInfo host_info;
+   return IsCanonicalHostGoogleHostname(net::CanonicalizeHost(host, &host_info),
+                                        subdomain_permission);
+ }
+ 
+ bool IsGoogleHomePageUrl(const GURL& url) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return false;
+   // First check to see if this has a Google domain.
+   if (!IsGoogleDomainUrl(url, DISALLOW_SUBDOMAIN,
+                          DISALLOW_NON_STANDARD_PORTS) &&
+@@ -276,6 +284,8 @@ bool IsGoogleHomePageUrl(const GURL& url) {
+ }
+ 
+ bool IsGoogleSearchUrl(const GURL& url) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return false;
+   // First check to see if this has a Google domain.
+   if (!IsGoogleDomainUrl(url, DISALLOW_SUBDOMAIN,
+                          DISALLOW_NON_STANDARD_PORTS) &&
+@@ -304,11 +314,15 @@ bool IsGoogleSearchUrl(const GURL& url) {
+ bool IsYoutubeDomainUrl(const GURL& url,
+                         SubdomainPermission subdomain_permission,
+                         PortPermission port_permission) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return false;
+   return IsValidURL(url, port_permission) &&
+          IsCanonicalHostYoutubeHostname(url.host(), subdomain_permission);
+ }
+ 
+ bool IsGoogleAssociatedDomainUrl(const GURL& url) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return false;
+   if (IsGoogleDomainUrl(url, ALLOW_SUBDOMAIN, ALLOW_NON_STANDARD_PORTS)) {
+     return true;
+   }
+diff --git a/components/network_time/network_time_tracker.cc b/components/network_time/network_time_tracker.cc
+index 9a78ac2..f76493e 100644
+--- a/components/network_time/network_time_tracker.cc
++++ b/components/network_time/network_time_tracker.cc
+@@ -329,8 +329,8 @@ void NetworkTimeTracker::UpdateNetworkTime(base::Time network_time,
+ }
+ 
+ bool NetworkTimeTracker::AreTimeFetchesEnabled() const {
+-  return is_initialized() &&
+-         base::FeatureList::IsEnabled(kNetworkTimeServiceQuerying);
++  // Supermium: never query the Google time service.
++  return false;
+ }
+ 
+ NetworkTimeTracker::FetchBehavior NetworkTimeTracker::GetFetchBehavior() const {
+diff --git a/components/omnibox/browser/autocomplete_match.cc b/components/omnibox/browser/autocomplete_match.cc
+index 1aca45e..3b12f8c 100644
+--- a/components/omnibox/browser/autocomplete_match.cc
++++ b/components/omnibox/browser/autocomplete_match.cc
+@@ -2389,7 +2389,13 @@ bool AutocompleteMatch::TryRichAutocompletion(
+     // This case intentionally doesn't set |rich_autocompletion_triggered| since
+     // presumably non-rich autocompletion should also be able to handle this
+     // case.
+-    inline_autocompletion = primary_text.substr(input_text_lower.length());
++    // Supermium: ToLower() can make a string longer (e.g. U+0130), so the
++    // lowercased input can be longer than `primary_text`.
++    if (primary_text.length() >= input_text_lower.length()) {
++      inline_autocompletion = primary_text.substr(input_text_lower.length());
++    } else {
++      inline_autocompletion = primary_text.substr(primary_text.length());
++    }
+     allowed_to_be_default_match = true;
+     RecordAdditionalInfo("autocompletion", "primary & prefix");
+     return true;
+diff --git a/components/optimization_guide/core/delivery/prediction_model_fetcher_impl.cc b/components/optimization_guide/core/delivery/prediction_model_fetcher_impl.cc
+index 57904e6..54eba78 100644
+--- a/components/optimization_guide/core/delivery/prediction_model_fetcher_impl.cc
++++ b/components/optimization_guide/core/delivery/prediction_model_fetcher_impl.cc
+@@ -129,6 +129,13 @@ bool PredictionModelFetcherImpl::FetchOptimizationGuideServiceModels(
+       // not enabled on incognito sessions and is rechecked before each fetch.
+       variations::InIncognito::kNo, variations::SignedIn::kNo,
+       traffic_annotation);
++  // Supermium: CreateSimpleURLLoaderWithVariationsHeader() returns null with
++  // --ungoogled-supermium.
++  if (!url_loader_) {
++    pending_models_request_.reset();
++    std::move(models_fetched_callback).Run(nullptr);
++    return false;
++  }
+ 
+   url_loader_->AttachStringForUpload(serialized_request,
+                                      "application/x-protobuf");
+diff --git a/components/optimization_guide/core/hints/hints_fetcher.cc b/components/optimization_guide/core/hints/hints_fetcher.cc
+index 67ab504..9828515 100644
+--- a/components/optimization_guide/core/hints/hints_fetcher.cc
++++ b/components/optimization_guide/core/hints/hints_fetcher.cc
+@@ -331,6 +331,12 @@ bool HintsFetcher::FetchOptimizationGuideServiceHints(
+       // fetch.
+       variations::InIncognito::kNo, variations::SignedIn::kNo,
+       traffic_annotation);
++  // Supermium: CreateSimpleURLLoaderWithVariationsHeader() returns null with
++  // --ungoogled-supermium.
++  if (!active_url_loader_) {
++    std::move(hints_fetched_callback).Run(std::nullopt);
++    return false;
++  }
+ 
+   active_url_loader_->AttachStringForUpload(serialized_request,
+                                             "application/x-protobuf");
+diff --git a/components/os_crypt/async/browser/os_crypt_win.cc b/components/os_crypt/async/browser/os_crypt_win.cc
+index 5fc6f10..8fa2f9b 100644
+--- a/components/os_crypt/async/browser/os_crypt_win.cc
++++ b/components/os_crypt/async/browser/os_crypt_win.cc
+@@ -76,12 +76,9 @@ bool EncryptStringWithDPAPI(const std::string& plaintext,
+   return true;
+ }
+ 
+-bool DecryptStringWithDPAPI(const std::string& ciphertext,
+-                            std::string* plaintext) {
+-  if (base::CommandLine::ForCurrentProcess()->HasSwitch("disable-encryption")){
+-    *plaintext = ciphertext;
+-    return true;
+-  }
++// Decrypts with DPAPI even with --disable-encryption.
++bool UnprotectStringWithDPAPI(const std::string& ciphertext,
++                              std::string* plaintext) {
+   DATA_BLOB input;
+   input.pbData =
+       const_cast<BYTE*>(reinterpret_cast<const BYTE*>(ciphertext.data()));
+@@ -101,6 +98,15 @@ bool DecryptStringWithDPAPI(const std::string& ciphertext,
+   return true;
+ }
+ 
++bool DecryptStringWithDPAPI(const std::string& ciphertext,
++                            std::string* plaintext) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("disable-encryption")){
++    *plaintext = ciphertext;
++    return true;
++  }
++  return UnprotectStringWithDPAPI(ciphertext, plaintext);
++}
++
+ bool EncryptAndStoreKey(const std::string& key, PrefService* local_state) {
+   std::string encrypted_key;
+   if (!EncryptStringWithDPAPI(key, &encrypted_key)) {
+@@ -113,11 +119,77 @@ bool EncryptAndStoreKey(const std::string& key, PrefService* local_state) {
+   return true;
+ }
+ 
++// Supermium: with --disable-encryption the key is stored unprotected (the
++// DPAPI helpers above copy the data), so the user data directory can be moved
++// to another machine. A key that a run without the switch protected with
++// DPAPI is unprotected here and stored again in the clear, so the data
++// encrypted with it stays readable. If that is not possible (e.g. the profile
++// comes from another machine), the key is dropped and Init() makes a new one.
++void UnprotectExistingKey(PrefService* local_state) {
++  if (!local_state->HasPrefPath(kOsCryptEncryptedKeyPrefName)) {
++    return;
++  }
++
++  std::string encrypted_key_with_header;
++  if (!base::Base64Decode(local_state->GetString(kOsCryptEncryptedKeyPrefName),
++                          &encrypted_key_with_header) ||
++      !base::StartsWith(encrypted_key_with_header, kDPAPIKeyPrefix,
++                        base::CompareCase::SENSITIVE)) {
++    // Left to InitWithExistingKey(), which reports kInvalidKeyFormat.
++    return;
++  }
++
++  const std::string encrypted_key =
++      encrypted_key_with_header.substr(sizeof(kDPAPIKeyPrefix) - 1);
++  if (encrypted_key.size() == Encryptor::Key::kAES256GCMKeySize) {
++    // Already stored in the clear. A DPAPI blob is always longer.
++    return;
++  }
++
++  std::string key;
++  if (UnprotectStringWithDPAPI(encrypted_key, &key) &&
++      key.size() == Encryptor::Key::kAES256GCMKeySize &&
++      EncryptAndStoreKey(key, local_state)) {
++    return;
++  }
++
++  local_state->ClearPref(kOsCryptEncryptedKeyPrefName);
++}
++
++// Supermium: a key that --disable-encryption stored in the clear is protected
++// with DPAPI again when the switch is gone, so the data encrypted with it
++// stays readable. A DPAPI blob is always longer than a raw key.
++void ProtectUnprotectedKey(PrefService* local_state) {
++  if (!local_state->HasPrefPath(kOsCryptEncryptedKeyPrefName)) {
++    return;
++  }
++
++  std::string encrypted_key_with_header;
++  if (!base::Base64Decode(local_state->GetString(kOsCryptEncryptedKeyPrefName),
++                          &encrypted_key_with_header) ||
++      !base::StartsWith(encrypted_key_with_header, kDPAPIKeyPrefix,
++                        base::CompareCase::SENSITIVE)) {
++    return;
++  }
++
++  const std::string key =
++      encrypted_key_with_header.substr(sizeof(kDPAPIKeyPrefix) - 1);
++  if (key.size() != Encryptor::Key::kAES256GCMKeySize) {
++    return;
++  }
++
++  // Without the switch EncryptStringWithDPAPI() really protects the key. On
++  // failure the clear key stays and Init() behaves as upstream.
++  std::ignore = EncryptAndStoreKey(key, local_state);
++}
++
+ }  // namespace
+ 
+ bool Init(PrefService* local_state) {
+   if (base::CommandLine::ForCurrentProcess()->HasSwitch("disable-encryption")) {
+-    return true;
++    UnprotectExistingKey(local_state);
++  } else {
++    ProtectUnprotectedKey(local_state);
+   }
+   switch (InitWithExistingKey(local_state)) {
+     case InitResult::kSuccess:
+diff --git a/components/themes/ntp_background_service.cc b/components/themes/ntp_background_service.cc
+index 54a4222..fa4fd8f 100644
+--- a/components/themes/ntp_background_service.cc
++++ b/components/themes/ntp_background_service.cc
+@@ -91,6 +91,8 @@ void NtpBackgroundService::Shutdown() {
+ 
+ void NtpBackgroundService::FetchCollectionInfo(
+     const std::string& filtering_label) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("ungoogled-supermium"))
++    return;
+   // If a request is currently in progress, drop the new request.
+   if (collections_loader_ != nullptr) {
+     return;
+diff --git a/components/url_formatter/url_fixer.cc b/components/url_formatter/url_fixer.cc
+index 9b655b1..9d3aba8 100644
+--- a/components/url_formatter/url_fixer.cc
++++ b/components/url_formatter/url_fixer.cc
+@@ -640,8 +640,9 @@ GURL FixupURLInternal(const std::string& text,
+     }
+     if (chrome_url && !parts.host.is_valid() &&
+         (!base::CommandLine::ForCurrentProcess()->HasSwitch("omnibox-autocomplete-filtering") ||
+-         base::ContainsOnlyChars(base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII
+-         ("omnibox-autocomplete-filtering"), "chrome"))) {
++         base::CommandLine::ForCurrentProcess()
++                 ->GetSwitchValueASCII("omnibox-autocomplete-filtering")
++                 .find("chrome") != std::string::npos)) {
+       url.append(kChromeUIDefaultHost);
+     }
+     FixupPort(trimmed, parts.port, &url);
+diff --git a/content/browser/browser_main_loop.cc b/content/browser/browser_main_loop.cc
+index 90ee66b..072d468 100644
+--- a/content/browser/browser_main_loop.cc
++++ b/content/browser/browser_main_loop.cc
+@@ -203,6 +203,7 @@
+ #include <commctrl.h>
+ #include <shellapi.h>
+ 
++#include "base/win/win_util.h"
+ #include "net/base/winsock_init.h"
+ #endif
+ 
+@@ -1177,7 +1178,8 @@ void BrowserMainLoop::ShutdownThreadsAndCleanUp() {
+       base::BindOnce(base::IgnoreResult(
+           &base::PermanentThreadAllowance::AllowBaseSyncPrimitives)));
+ 
+-  if (RenderProcessHost::run_renderer_in_process())
++  const bool is_single_process = RenderProcessHost::run_renderer_in_process();
++  if (is_single_process)
+     RenderProcessHostImpl::ShutDownInProcessRenderer();
+ 
+   if (parts_) {
+@@ -1300,6 +1302,15 @@ void BrowserMainLoop::ShutdownThreadsAndCleanUp() {
+     std::ignore = audio_system_.release();
+   }
+ 
++#if BUILDFLAG(IS_WIN)
++  // In single-process mode the in-process renderer was leaked above; the rest
++  // of the teardown crashes or hangs, so exit now that the threads are gone.
++  if (is_single_process) {
++    base::win::SetShouldCrashOnProcessDetach(false);
++    ::ExitProcess(0);
++  }
++#endif
++
+   if (parts_) {
+     TRACE_EVENT0("shutdown", "BrowserMainLoop::Subsystem:PostDestroyThreads");
+     parts_->PostDestroyThreads();
+diff --git a/content/browser/gpu/gpu_process_host.cc b/content/browser/gpu/gpu_process_host.cc
+index 21ff854..e794bdc 100644
+--- a/content/browser/gpu/gpu_process_host.cc
++++ b/content/browser/gpu/gpu_process_host.cc
+@@ -264,6 +264,7 @@ static const char* const kSwitchNames[] = {
+     sandbox::policy::switches::kDisableGpuSandbox,
+     sandbox::policy::switches::kDisableLandlockSandbox,
+     sandbox::policy::switches::kNoSandbox,
++    "legacy-sandbox",
+ #if BUILDFLAG(IS_WIN)
+     sandbox::policy::switches::kAllowThirdPartyModules,
+ #endif
+diff --git a/content/browser/renderer_host/dwrite_font_proxy_impl_win.cc b/content/browser/renderer_host/dwrite_font_proxy_impl_win.cc
+index f855592..8b10c30 100644
+--- a/content/browser/renderer_host/dwrite_font_proxy_impl_win.cc
++++ b/content/browser/renderer_host/dwrite_font_proxy_impl_win.cc
+@@ -486,10 +486,10 @@ void DWriteFontProxyImpl::MatchUniqueFont(
+                                                          base::File(), 0);
+   InitializeDirectWrite();
+ 
+-  // We must not get here if this version of DWrite can't handle performing the
+-  // search.
+-  DCHECK(factory3_.Get());
+-  DCHECK(collection_);
++  // Pre-Win10 versions of DWrite can't handle performing the search.
++  if (!factory3_ || !collection_) {
++    return;
++  }
+   Microsoft::WRL::ComPtr<IDWriteFontCollection1> collection1;
+   HRESULT hr = collection_.As(&collection1);
+   if (FAILED(hr)) {
+@@ -586,19 +586,20 @@ void DWriteFontProxyImpl::InitializeDirectWrite() {
+     return;
+   }
+ 
+-  // QueryInterface for IDWriteFactory2. This should succeed since we only
+-  // support >= Win10.
++  // QueryInterface for IDWriteFactory2. It's ok for this to fail if we are
++  // running an older version of DirectWrite (earlier than Win8.1).
+   factory_.As<IDWriteFactory2>(&factory2_);
+-  DCHECK(factory2_);
+ 
+-  // QueryInterface for IDwriteFactory3, needed for MatchUniqueFont on Windows.
+-  // This should succeed since we only support >= Win10.
++  // QueryInterface for IDwriteFactory3, needed for MatchUniqueFont on Windows
++  // 10. May fail on older versions of DirectWrite.
+   factory_.As<IDWriteFactory3>(&factory3_);
+-  DCHECK(factory3_);
+ 
+   // Normally identical to factory_->GetSystemFontCollection() unless a
+-  // sideloaded font has been added using SideLoadFontForTesting().
+-  HRESULT hr = GetLocalFontCollection(factory3_, &collection_);
++  // sideloaded font has been added using SideLoadFontForTesting(). If
++  // IDWriteFactory3 is unavailable (pre-Win10 DirectWrite), fall back to
++  // GetSystemFontCollection.
++  HRESULT hr = factory3_ ? GetLocalFontCollection(factory3_, &collection_)
++                         : factory_->GetSystemFontCollection(&collection_);
+   DCHECK(SUCCEEDED(hr));
+ 
+   if (!collection_) {
+diff --git a/content/browser/renderer_host/media/media_devices_manager.cc b/content/browser/renderer_host/media/media_devices_manager.cc
+index 5a47f1a..fe818c6 100644
+--- a/content/browser/renderer_host/media/media_devices_manager.cc
++++ b/content/browser/renderer_host/media/media_devices_manager.cc
+@@ -918,8 +918,7 @@ void MediaDevicesManager::StartMonitoringAndPopulateCache(
+              video_capture::features::
+                  kWinCameraMonitoringInVideoCaptureService) ||
+          switches::IsMediaFoundationCameraUsageMonitoringEnabled()) &&
+-        !base::FeatureList::IsEnabled(
+-            features::kRunVideoCaptureServiceInBrowserProcess)) {
++        features::IsVideoCaptureServiceEnabledForOutOfProcess()) {
+       RegisterVideoCaptureDevicesChangedObserver();
+     }
+ #endif
+@@ -1831,8 +1830,7 @@ void MediaDevicesManager::NotifyDeviceChange(
+ #if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN)
+ void MediaDevicesManager::RegisterVideoCaptureDevicesChangedObserver() {
+   CHECK(!video_capture_service_device_changed_observer_);
+-  if (base::FeatureList::IsEnabled(
+-          features::kRunVideoCaptureServiceInBrowserProcess)) {
++  if (features::IsVideoCaptureServiceEnabledForBrowserProcess()) {
+     // Do not create a mojo connection when the video capture service is running
+     // in the browser process as the device monitor will send device change
+     // notifications directly to the system monitor in the browser process.
+diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
+index a37324c..fe935a8 100644
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -1757,13 +1757,19 @@ void RenderProcessHostImpl::ShutDownInProcessRenderer() {
+       for (auto& observer : host->observers_) {
+         observer.InProcessRendererExiting(host);
+       }
+-      for (auto& observer : host->observers_) {
+-        observer.RenderProcessHostDestroyed(host);
+-      }
++      // With --single-process the host is intentionally leaked: destroying it
++      // here crashes or hangs. On Windows the process exits right after the
++      // threads are torn down (see BrowserMainLoop::ShutdownThreadsAndCleanUp).
++      if (!base::CommandLine::ForCurrentProcess()->HasSwitch(
++              switches::kSingleProcess)) {
++        for (auto& observer : host->observers_) {
++          observer.RenderProcessHostDestroyed(host);
++        }
+ #ifndef NDEBUG
+-      host->is_self_deleted_ = true;
++        host->is_self_deleted_ = true;
+ #endif
+-      delete host;
++        delete host;
++      }
+       return;
+     }
+     default:
+diff --git a/content/public/browser/desktop_capture.cc b/content/public/browser/desktop_capture.cc
+index 55d4978..7b531c8 100644
+--- a/content/public/browser/desktop_capture.cc
++++ b/content/public/browser/desktop_capture.cc
+@@ -68,7 +68,8 @@ webrtc::DesktopCaptureOptions CreateDesktopCaptureOptions() {
+   // to force fallback to GDI.
+   static BASE_FEATURE(kDirectXCapturer, "DirectXCapturer",
+                       base::FEATURE_ENABLED_BY_DEFAULT);
+-  if (base::FeatureList::IsEnabled(kDirectXCapturer)) {
++  if (base::win::GetVersion() >= base::win::Version::WIN8_1 &&
++      base::FeatureList::IsEnabled(kDirectXCapturer)) {
+     // Results in DirectX as main capture API and GDI as fallback solution.
+     options.set_allow_directx_capturer(true);
+   }
+diff --git a/content/public/common/content_features.cc b/content/public/common/content_features.cc
+index 060453a..493fd05 100644
+--- a/content/public/common/content_features.cc
++++ b/content/public/common/content_features.cc
+@@ -20,6 +20,10 @@
+ #include "base/android/device_info.h"
+ #endif
+ 
++#if BUILDFLAG(IS_WIN)
++#include "base/win/windows_version.h"
++#endif
++
+ namespace features {
+ 
+ // All features in alphabetical order.
+@@ -1535,6 +1539,11 @@ VideoCaptureServiceConfiguration GetVideoCaptureServiceConfiguration() {
+ #elif BUILDFLAG(IS_IOS)
+   return VideoCaptureServiceConfiguration::kEnabledForBrowserProcess;
+ #else
++#if BUILDFLAG(IS_WIN)
++  if (base::win::GetVersion() <= base::win::Version::WIN7) {
++    return VideoCaptureServiceConfiguration::kEnabledForBrowserProcess;
++  }
++#endif
+   return base::FeatureList::IsEnabled(
+              features::kRunVideoCaptureServiceInBrowserProcess)
+              ? VideoCaptureServiceConfiguration::kEnabledForBrowserProcess
+diff --git a/content/renderer/renderer_main.cc b/content/renderer/renderer_main.cc
+index 33c60ca..ec8cbe7 100644
+--- a/content/renderer/renderer_main.cc
++++ b/content/renderer/renderer_main.cc
+@@ -60,6 +60,7 @@
+ #include "ui/base/ui_base_switches.h"
+ 
+ #if BUILDFLAG(IS_WIN)
++#include "base/win/windows_version.h"
+ #include "components/startup_metric_utils/renderer/startup_metric_utils.h"
+ #endif  // BUILDFLAG(IS_WIN)
+ 
+@@ -232,6 +233,13 @@ int RendererMain(MainFunctionParams parameters) {
+     bool should_run_loop = true;
+     bool need_sandbox =
+         !command_line.HasSwitch(sandbox::policy::switches::kNoSandbox);
++#if BUILDFLAG(IS_WIN)
++    // Before Windows 10 the renderer doesn't lower its token (legacy sandbox),
++    // which is necessary to have a functional sandbox there.
++    if (base::win::GetVersion() < base::win::Version::WIN10) {
++      need_sandbox = false;
++    }
++#endif
+ 
+     if (!need_sandbox) {
+       // The post-sandbox actions still need to happen at some point.
+diff --git a/extensions/common/extension.cc b/extensions/common/extension.cc
+index 921ca88..a9966f9 100644
+--- a/extensions/common/extension.cc
++++ b/extensions/common/extension.cc
+@@ -68,7 +68,7 @@ constexpr int kPEMOutputColumns = 64;
+ static_assert(kMaximumSupportedManifestVersion >=
+                   kMinimumSupportedManifestVersion,
+               "The modern manifest version must be supported.");
+-bool g_silence_deprecated_manifest_version_warnings = false;
++bool g_silence_deprecated_manifest_version_warnings = true;
+ 
+ // KEY MARKERS
+ constexpr char kKeyBeginHeaderMarker[] = "-----BEGIN";
+diff --git a/gpu/config/gpu_driver_bug_list.json b/gpu/config/gpu_driver_bug_list.json
+index fb2e73f..06c0c14 100644
+--- a/gpu/config/gpu_driver_bug_list.json
++++ b/gpu/config/gpu_driver_bug_list.json
+@@ -891,6 +891,21 @@
+         "disable_post_sub_buffers_for_onscreen_surfaces"
+       ]
+     },
++    {
++      "id": 170,
++      "description": "Zero copy DXGI video hangs on shutdown on Win < 8.1",
++      "cr_bugs": [621190],
++      "os": {
++        "type": "win",
++        "version": {
++          "op": "<",
++          "value": "8.1"
++        }
++      },
++      "features": [
++        "disable_dxgi_zero_copy_video"
++      ]
++    },
+     {
+       "id": 176,
+       "description": "glClear does not work on Acer Predator GT-810",
+diff --git a/gpu/config/gpu_info_collector_win.cc b/gpu/config/gpu_info_collector_win.cc
+index e0f68da..94c8472 100644
+--- a/gpu/config/gpu_info_collector_win.cc
++++ b/gpu/config/gpu_info_collector_win.cc
+@@ -24,6 +24,7 @@
+ #include "base/logging.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/metrics/histogram_macros.h"
++#include "base/native_library.h"
+ #include "base/numerics/safe_conversions.h"
+ #include "base/path_service.h"
+ #include "base/scoped_native_library.h"
+@@ -336,6 +337,17 @@ bool CollectDriverInfoD3D(GPUInfo* gpu_info) {
+ 
+   CollectNPUInformation(gpu_info);
+ 
++  // dxgi.dll is delay-loaded. It does not exist on XP/2003, and Vista without
++  // the Platform Update has no CreateDXGIFactory1, so calling it there would
++  // crash the GPU process in the delay-load failure hook.
++  HMODULE dxgi_module = ::GetModuleHandleW(L"dxgi.dll");
++  if (!dxgi_module) {
++    dxgi_module = base::LoadSystemLibrary(L"dxgi.dll");
++  }
++  if (!dxgi_module || !::GetProcAddress(dxgi_module, "CreateDXGIFactory1")) {
++    return false;
++  }
++
+   Microsoft::WRL::ComPtr<IDXGIFactory1> dxgi_factory;
+   HRESULT hr = ::CreateDXGIFactory1(IID_PPV_ARGS(&dxgi_factory));
+   if (FAILED(hr))
+diff --git a/gpu/config/software_rendering_list.json b/gpu/config/software_rendering_list.json
+index a7c3a65..b74a2d2 100644
+--- a/gpu/config/software_rendering_list.json
++++ b/gpu/config/software_rendering_list.json
+@@ -403,6 +403,21 @@
+         "accelerated_video_decode"
+       ]
+     },
++    {
++      "id": 79,
++      "description": "Disable GPU on all Windows versions prior to and including Vista",
++      "cr_bugs": [315199],
++      "os": {
++        "type": "win",
++        "version": {
++          "op": "<=",
++          "value": "6.0"
++        }
++      },
++      "features": [
++        "all"
++      ]
++    },
+     {
+       "id": 86,
+       "description": "Intel Graphics Media Accelerator 3150 causes the GPU process to hang running WebGL",
+diff --git a/media/capture/video/win/video_capture_device_factory_win.cc b/media/capture/video/win/video_capture_device_factory_win.cc
+index 70bbb9a..2c77ea8 100644
+--- a/media/capture/video/win/video_capture_device_factory_win.cc
++++ b/media/capture/video/win/video_capture_device_factory_win.cc
+@@ -316,6 +316,14 @@ bool DevicesInfoContainsDeviceId(const DevicesInfo& devices_info,
+                                });
+ }
+ 
++bool IsEnclosureLocationSupported() {
++  // If there's no UWP device enumeration API, which is the case before Windows
++  // 10, access to video and audio capture will break on certain sites,
++  // specifically those using webkit APIs to access those devices.
++  // Someday, progwrp will get the Ro* interfaces, but this will do for now.
++  return base::win::GetVersion() >= base::win::Version::WIN10;
++}
++
+ // Returns a non DirectShow descriptor DevicesInfo with the provided name and
+ // model.
+ DevicesInfo::const_iterator FindNonDirectShowDeviceInfoByNameAndModel(
+@@ -818,6 +826,11 @@ void VideoCaptureDeviceFactoryWin::GetDevicesInfo(
+     devices_info = GetDevicesInfoDirectShow(devices_info);
+   }
+ 
++  if (!IsEnclosureLocationSupported()) {
++    DeviceInfoReady(std::move(devices_info), std::move(callback));
++    return;
++  }
++
+   if (!com_thread_.IsRunning()) {
+     com_thread_.init_com_with_mta(true);
+     com_thread_.Start();
+diff --git a/sandbox/policy/win/sandbox_win.cc b/sandbox/policy/win/sandbox_win.cc
+index 27d0f3d..6a2652a 100644
+--- a/sandbox/policy/win/sandbox_win.cc
++++ b/sandbox/policy/win/sandbox_win.cc
+@@ -736,9 +736,6 @@ void SandboxWin::AddBaseHandleClosePolicy(TargetConfig* config) {
+ ResultCode SandboxWin::AddAppContainerPolicy(TargetConfig* config,
+                                              base::wcstring_view sid) {
+   DCHECK(!config->IsConfigured());
+-  // Win32k Lockdown is supported on Windows 8+.
+-  if (base::win::GetVersion() < base::win::Version::WIN8)
+-    return SBOX_ALL_OK;
+   if (IsAppContainerEnabled()) {
+     ResultCode result = config->SetLowBox(sid);
+     if (result != SBOX_ALL_OK) {
+@@ -753,6 +750,9 @@ ResultCode SandboxWin::AddAppContainerPolicy(TargetConfig* config,
+ // static
+ ResultCode SandboxWin::AddWin32kLockdownPolicy(TargetConfig* config) {
+   DCHECK(!config->IsConfigured());
++  // Win32k Lockdown is supported on Windows 8+.
++  if (base::win::GetVersion() < base::win::Version::WIN8)
++    return SBOX_ALL_OK;
+   MitigationFlags flags = config->GetProcessMitigations();
+   // Check not enabling twice. Should not happen.
+   DCHECK_EQ(0U, flags & MITIGATION_WIN32K_DISABLE);
+diff --git a/services/preferences/tracked/tracked_split_preference.cc b/services/preferences/tracked/tracked_split_preference.cc
+index 484fe52..4ae6095 100644
+--- a/services/preferences/tracked/tracked_split_preference.cc
++++ b/services/preferences/tracked/tracked_split_preference.cc
+@@ -7,6 +7,7 @@
+ #include <vector>
+ 
+ #include "base/check.h"
++#include "base/command_line.h"
+ #include "base/notreached.h"
+ #include "base/values.h"
+ #include "services/preferences/public/cpp/tracked/pref_names.h"
+@@ -102,6 +103,12 @@ bool TrackedSplitPreference::EnforceAndReport(
+   }
+   TrackedPreferenceHelper::ResetAction reset_action =
+       helper_.GetAction(value_state);
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("disable-machine-id") ||
++      base::CommandLine::ForCurrentProcess()->HasSwitch("disable-encryption") ||
++      base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "revert-from-portable")) {
++    reset_action = TrackedPreferenceHelper::DONT_RESET;
++  }
+   helper_.ReportAction(reset_action);
+ 
+   if (reset_action == TrackedPreferenceHelper::DO_RESET ||
+diff --git a/third_party/blink/renderer/core/frame/navigator_ua.idl b/third_party/blink/renderer/core/frame/navigator_ua.idl
+index 3a74d65..00669e1 100644
+--- a/third_party/blink/renderer/core/frame/navigator_ua.idl
++++ b/third_party/blink/renderer/core/frame/navigator_ua.idl
+@@ -4,6 +4,8 @@
+ 
+ // https://github.com/WICG/ua-client-hints
+ 
+-interface mixin NavigatorUA {
++[
++    RuntimeEnabled=UserAgentClientHint
++] interface mixin NavigatorUA {
+   [SecureContext] readonly attribute NavigatorUAData userAgentData;
+ };
+diff --git a/third_party/blink/renderer/core/html/media/html_media_element.cc b/third_party/blink/renderer/core/html/media/html_media_element.cc
+index 3cc55c0..3e330d2 100644
+--- a/third_party/blink/renderer/core/html/media/html_media_element.cc
++++ b/third_party/blink/renderer/core/html/media/html_media_element.cc
+@@ -33,6 +33,7 @@
+ 
+ #include "base/auto_reset.h"
+ #include "base/check_is_test.h"
++#include "base/command_line.h"
+ #include "base/containers/span.h"
+ #include "base/feature_list.h"
+ #include "base/memory/ptr_util.h"
+@@ -3095,7 +3096,20 @@ ScriptPromise<IDLUndefined> HTMLMediaElement::playForBindings(
+   auto promise = resolver->Promise();
+   play_promise_resolvers_.push_back(resolver);
+ 
+-  std::optional<DOMExceptionCode> code = Play();
++  // With --autoplay-policy=document-user-activation-required ("Autoplay
++  // Disabled" in chrome://flags), a script-initiated play() is only allowed
++  // after the user interacted with this frame. Unlike the upstream policy, this
++  // also blocks muted autoplay and the Media Engagement bypass.
++  // TODO(supermium): split this into a separate option that flushes the history
++  // when the page is refreshed.
++  std::optional<DOMExceptionCode> code = DOMExceptionCode::kNotAllowedError;
++  LocalFrame* frame = GetDocument().GetFrame();
++  if ((frame && frame->IsHistoryUserActivationActive()) ||
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++          ::switches::kAutoplayPolicy) !=
++          ::switches::autoplay::kDocumentUserActivationRequiredPolicy) {
++    code = Play();
++  }
+   if (code) {
+     DCHECK(!play_promise_resolvers_.empty());
+     play_promise_resolvers_.pop_back();
+diff --git a/ui/base/ime/init/input_method_factory.cc b/ui/base/ime/init/input_method_factory.cc
+index c99fd18..e05f96f 100644
+--- a/ui/base/ime/init/input_method_factory.cc
++++ b/ui/base/ime/init/input_method_factory.cc
+@@ -13,6 +13,8 @@
+ #include "ui/gfx/switches.h"
+ 
+ #if BUILDFLAG(IS_WIN)
++#include "base/win/windows_version.h"
++#include "ui/base/ime/win/input_method_win_imm32.h"
+ #include "ui/base/ime/win/input_method_win_tsf.h"
+ #elif BUILDFLAG(IS_APPLE)
+ #include "ui/base/ime/mac/input_method_mac.h"
+@@ -30,6 +32,15 @@ bool g_input_method_set_for_testing = false;
+ 
+ bool g_create_input_method_called = false;
+ 
++#if BUILDFLAG(IS_WIN)
++// TSF is used on Windows 8 and newer unless TSFImeSupport is disabled; older
++// Windows use IMM32.
++bool IsUsingTSFForIME() {
++  return base::win::GetVersion() >= base::win::Version::WIN8 &&
++         base::FeatureList::IsEnabled(features::kTSFImeSupport);
++}
++#endif
++
+ }  // namespace
+ 
+ namespace ui {
+@@ -53,7 +64,12 @@ std::unique_ptr<InputMethod> CreateInputMethod(
+     return base::WrapUnique(new MockInputMethod(ime_key_event_dispatcher));
+ 
+ #if BUILDFLAG(IS_WIN)
+-  return std::make_unique<InputMethodWinTSF>(ime_key_event_dispatcher, widget);
++  if (IsUsingTSFForIME()) {
++    return std::make_unique<InputMethodWinTSF>(ime_key_event_dispatcher,
++                                               widget);
++  }
++  return std::make_unique<InputMethodWinImm32>(ime_key_event_dispatcher,
++                                               widget);
+ #elif BUILDFLAG(IS_APPLE)
+   return std::make_unique<InputMethodMac>(ime_key_event_dispatcher);
+ #elif BUILDFLAG(IS_OZONE)
+diff --git a/ui/base/ime/win/BUILD.gn b/ui/base/ime/win/BUILD.gn
+index 8972a21..c352d52 100644
+--- a/ui/base/ime/win/BUILD.gn
++++ b/ui/base/ime/win/BUILD.gn
+@@ -7,8 +7,12 @@ assert(is_win)
+ component("win") {
+   output_name = "ui_base_ime_win"
+   sources = [
++    "imm32_manager.cc",
++    "imm32_manager.h",
+     "input_method_win_base.cc",
+     "input_method_win_base.h",
++    "input_method_win_imm32.cc",
++    "input_method_win_imm32.h",
+     "input_method_win_tsf.cc",
+     "input_method_win_tsf.h",
+     "mock_tsf_bridge.cc",
+@@ -39,4 +43,8 @@ component("win") {
+     "//ui/base",
+     "//ui/display",
+   ]
++
++  libs = [ "imm32.lib" ]
++
++  ldflags = [ "/DELAYLOAD:imm32.dll" ]
+ }
+diff --git a/ui/base/ime/win/imm32_manager.cc b/ui/base/ime/win/imm32_manager.cc
+new file mode 100644
+index 0000000..df36c4e
+--- /dev/null
++++ b/ui/base/ime/win/imm32_manager.cc
+@@ -0,0 +1,491 @@
++// Copyright 2013 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifdef UNSAFE_BUFFERS_BUILD
++#pragma allow_unsafe_buffers
++#endif
++
++#include "ui/base/ime/win/imm32_manager.h"
++
++#include <stdint.h>
++
++#include <memory>
++#include <string>
++
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "third_party/skia/include/core/SkColor.h"
++#include "ui/base/ime/composition_text.h"
++
++///////////////////////////////////////////////////////////////////////////////
++// IMM32Manager
++
++namespace {
++
++// Determines whether or not the given attribute represents a target
++// (a.k.a. a selection).
++bool IsTargetAttribute(char attribute) {
++  return (attribute == ATTR_TARGET_CONVERTED ||
++          attribute == ATTR_TARGET_NOTCONVERTED);
++}
++
++// Helper function for IMM32Manager::GetCompositionInfo() method, to get the
++// target range that's selected by the user in the current composition string.
++void GetCompositionTargetRange(HIMC imm_context, int* target_start,
++                               int* target_end) {
++  int attribute_size = ::ImmGetCompositionString(imm_context, GCS_COMPATTR,
++                                                 NULL, 0);
++  if (attribute_size > 0) {
++    int start = 0;
++    int end = 0;
++    std::unique_ptr<char[]> attribute_data(new char[attribute_size]);
++    if (attribute_data.get()) {
++      ::ImmGetCompositionString(imm_context, GCS_COMPATTR,
++                                attribute_data.get(), attribute_size);
++      for (start = 0; start < attribute_size; ++start) {
++        if (IsTargetAttribute(attribute_data[start]))
++          break;
++      }
++      for (end = start; end < attribute_size; ++end) {
++        if (!IsTargetAttribute(attribute_data[end]))
++          break;
++      }
++    }
++    *target_start = start;
++    *target_end = end;
++  }
++}
++
++// Helper function for IMM32Manager::GetCompositionInfo() method, to get
++// underlines information of the current composition string.
++void GetImeTextSpans(HIMC imm_context,
++                     int target_start,
++                     int target_end,
++                     ui::ImeTextSpans* ime_text_spans) {
++  int clause_size = ::ImmGetCompositionString(imm_context, GCS_COMPCLAUSE,
++                                              NULL, 0);
++  int clause_length = clause_size / sizeof(uint32_t);
++  if (clause_length) {
++    std::unique_ptr<uint32_t[]> clause_data(new uint32_t[clause_length]);
++    if (clause_data.get()) {
++      ::ImmGetCompositionString(imm_context, GCS_COMPCLAUSE,
++                                clause_data.get(), clause_size);
++      for (int i = 0; i < clause_length - 1; ++i) {
++        ui::ImeTextSpan ime_text_span;
++        ime_text_span.start_offset = clause_data[i];
++        ime_text_span.end_offset = clause_data[i + 1];
++        ime_text_span.thickness = ui::ImeTextSpan::Thickness::kThin;
++        ime_text_span.background_color = SK_ColorTRANSPARENT;
++
++        // Use thick underline for the target clause.
++        if (ime_text_span.start_offset >= static_cast<uint32_t>(target_start) &&
++            ime_text_span.end_offset <= static_cast<uint32_t>(target_end)) {
++          ime_text_span.thickness = ui::ImeTextSpan::Thickness::kThick;
++        }
++        ime_text_spans->push_back(ime_text_span);
++      }
++    }
++  }
++}
++
++}  // namespace
++
++namespace ui {
++
++IMM32Manager::IMM32Manager()
++    : is_composing_(false),
++      input_language_id_(LANG_USER_DEFAULT),
++      system_caret_(false),
++      caret_rect_(-1, -1, 0, 0),
++      use_composition_window_(false) {
++}
++
++IMM32Manager::~IMM32Manager() {
++}
++
++void IMM32Manager::SetInputLanguage() {
++  // Retrieve the current input language from the system's keyboard layout.
++  // Using GetKeyboardLayoutName instead of GetKeyboardLayout, because
++  // the language from GetKeyboardLayout is the language under where the
++  // keyboard layout is installed. And the language from GetKeyboardLayoutName
++  // indicates the language of the keyboard layout itself.
++  // See crbug.com/344834.
++  WCHAR keyboard_layout[KL_NAMELENGTH];
++  if (::GetKeyboardLayoutNameW(keyboard_layout)) {
++    input_language_id_ =
++        static_cast<LANGID>(
++            wcstol(&keyboard_layout[KL_NAMELENGTH >> 1], nullptr, 16));
++  } else {
++    input_language_id_ = 0x0409;  // Fallback to en-US.
++  }
++}
++
++void IMM32Manager::CreateImeWindow(HWND window_handle) {
++  // When a user disables TSF (Text Service Framework) and CUAS (Cicero
++  // Unaware Application Support), Chinese IMEs somehow ignore function calls
++  // to ::ImmSetCandidateWindow(), i.e. they do not move their candidate
++  // window to the position given as its parameters, and use the position
++  // of the current system caret instead, i.e. it uses ::GetCaretPos() to
++  // retrieve the position of their IME candidate window.
++  // Therefore, we create a temporary system caret for Chinese IMEs and use
++  // it during this input context.
++  // Since some third-party Japanese IME also uses ::GetCaretPos() to determine
++  // their window position, we also create a caret for Japanese IMEs.
++  if (PRIMARYLANGID(input_language_id_) == LANG_CHINESE ||
++      PRIMARYLANGID(input_language_id_) == LANG_JAPANESE) {
++    if (!system_caret_) {
++      if (::CreateCaret(window_handle, NULL, 1, 1)) {
++        system_caret_ = true;
++      }
++    }
++  }
++  // Restore the positions of the IME windows.
++  UpdateImeWindow(window_handle);
++}
++
++LRESULT IMM32Manager::SetImeWindowStyle(HWND window_handle, UINT message,
++                                    WPARAM wparam, LPARAM lparam,
++                                    BOOL* handled) {
++  // To prevent the IMM (Input Method Manager) from displaying the IME
++  // composition window, Update the styles of the IME windows and EXPLICITLY
++  // call ::DefWindowProc() here.
++  // NOTE(hbono): We can NEVER let WTL call ::DefWindowProc() when we update
++  // the styles of IME windows because the 'lparam' variable is a local one
++  // and all its updates disappear in returning from this function, i.e. WTL
++  // does not call ::DefWindowProc() with our updated 'lparam' value but call
++  // the function with its original value and over-writes our window styles.
++  *handled = TRUE;
++  lparam &= ~ISC_SHOWUICOMPOSITIONWINDOW;
++  return ::DefWindowProc(window_handle, message, wparam, lparam);
++}
++
++void IMM32Manager::DestroyImeWindow(HWND window_handle) {
++  // Destroy the system caret if we have created for this IME input context.
++  if (system_caret_) {
++    ::DestroyCaret();
++    system_caret_ = false;
++  }
++}
++
++void IMM32Manager::MoveImeWindow(HWND window_handle, HIMC imm_context) {
++  // Does nothing when the target window has no input focus. This is important
++  // because the renderer may issue SelectionBoundsChanged event even when it
++  // has no input focus. (e.g. the page update caused by incremental search.)
++  // So this event should be ignored when the |window_handle| no longer has the
++  // input focus.
++  if (GetFocus() != window_handle)
++    return;
++
++  int x = caret_rect_.x();
++  int y = caret_rect_.y();
++
++  const int kCaretMargin = 1;
++  if (!use_composition_window_ &&
++      PRIMARYLANGID(input_language_id_) == LANG_CHINESE) {
++    // As written in a comment in IMM32Manager::CreateImeWindow(),
++    // Chinese IMEs ignore function calls to ::ImmSetCandidateWindow()
++    // when a user disables TSF (Text Service Framework) and CUAS (Cicero
++    // Unaware Application Support).
++    // On the other hand, when a user enables TSF and CUAS, Chinese IMEs
++    // ignore the position of the current system caret and uses the
++    // parameters given to ::ImmSetCandidateWindow() with its 'dwStyle'
++    // parameter CFS_CANDIDATEPOS.
++    // Therefore, we do not only call ::ImmSetCandidateWindow() but also
++    // set the positions of the temporary system caret if it exists.
++    CANDIDATEFORM candidate_position = {0, CFS_CANDIDATEPOS, {x, y},
++                                        {0, 0, 0, 0}};
++    ::ImmSetCandidateWindow(imm_context, &candidate_position);
++  }
++  if (system_caret_) {
++    switch (PRIMARYLANGID(input_language_id_)) {
++      case LANG_JAPANESE:
++        ::SetCaretPos(x, y + caret_rect_.height());
++        break;
++      default:
++        ::SetCaretPos(x, y);
++        break;
++    }
++  }
++  if (use_composition_window_) {
++    // Moves the composition text window.
++    COMPOSITIONFORM cf = {CFS_POINT, {x, y}};
++    ::ImmSetCompositionWindow(imm_context, &cf);
++    // Don't need to set the position of candidate window.
++    return;
++  }
++
++  if (PRIMARYLANGID(input_language_id_) == LANG_KOREAN) {
++    // Chinese IMEs and Japanese IMEs require the upper-left corner of
++    // the caret to move the position of their candidate windows.
++    // On the other hand, Korean IMEs require the lower-left corner of the
++    // caret to move their candidate windows.
++    y += kCaretMargin;
++  }
++  // Japanese IMEs and Korean IMEs also use the rectangle given to
++  // ::ImmSetCandidateWindow() with its 'dwStyle' parameter CFS_EXCLUDE
++  // to move their candidate windows when a user disables TSF and CUAS.
++  // Therefore, we also set this parameter here.
++  CANDIDATEFORM exclude_rectangle = {0, CFS_EXCLUDE, {x, y},
++      {x, y, x + caret_rect_.width(), y + caret_rect_.height()}};
++  ::ImmSetCandidateWindow(imm_context, &exclude_rectangle);
++}
++
++void IMM32Manager::UpdateImeWindow(HWND window_handle) {
++  // Just move the IME window attached to the given window.
++  if (caret_rect_.x() >= 0 && caret_rect_.y() >= 0) {
++    HIMC imm_context = ::ImmGetContext(window_handle);
++    if (imm_context) {
++      MoveImeWindow(window_handle, imm_context);
++      ::ImmReleaseContext(window_handle, imm_context);
++    }
++  }
++}
++
++void IMM32Manager::CleanupComposition(HWND window_handle) {
++  // Notify the IMM attached to the given window to complete the ongoing
++  // composition, (this case happens when the given window is de-activated
++  // while composing a text and re-activated), and reset the omposition status.
++  if (is_composing_) {
++    HIMC imm_context = ::ImmGetContext(window_handle);
++    if (imm_context) {
++      ::ImmNotifyIME(imm_context, NI_COMPOSITIONSTR, CPS_COMPLETE, 0);
++      ::ImmReleaseContext(window_handle, imm_context);
++    }
++    ResetComposition(window_handle);
++  }
++}
++
++void IMM32Manager::ResetComposition(HWND window_handle) {
++  // Currently, just reset the composition status.
++  is_composing_ = false;
++}
++
++void IMM32Manager::CompleteComposition(HWND window_handle, HIMC imm_context) {
++  // We have to confirm there is an ongoing composition before completing it.
++  // This is for preventing some IMEs from getting confused while completing an
++  // ongoing composition even if they do not have any ongoing compositions.)
++  if (is_composing_) {
++    ::ImmNotifyIME(imm_context, NI_COMPOSITIONSTR, CPS_COMPLETE, 0);
++    ResetComposition(window_handle);
++  }
++}
++
++void IMM32Manager::GetCompositionInfo(HIMC imm_context,
++                                      LPARAM lparam,
++                                      CompositionText* composition) {
++  // We only care about GCS_COMPATTR, GCS_COMPCLAUSE and GCS_CURSORPOS, and
++  // convert them into composition underlines and selection range respectively.
++  composition->ime_text_spans.clear();
++
++  int length = static_cast<int>(composition->text.length());
++
++  // Find out the range selected by the user.
++  int target_start = length;
++  int target_end = length;
++  if (lparam & GCS_COMPATTR)
++    GetCompositionTargetRange(imm_context, &target_start, &target_end);
++
++  // Retrieve the selection range information. If CS_NOMOVECARET is specified,
++  // that means the cursor should not be moved, then we just place the caret at
++  // the beginning of the composition string. Otherwise we should honour the
++  // GCS_CURSORPOS value if it's available.
++  // TODO(suzhe): due to a bug of webkit, we currently can't use selection range
++  // with composition string. See: https://bugs.webkit.org/show_bug.cgi?id=40805
++  if (!(lparam & CS_NOMOVECARET) && (lparam & GCS_CURSORPOS)) {
++    // IMM32 does not support non-zero-width selection in a composition. So
++    // always use the caret position as selection range.
++    int cursor = ::ImmGetCompositionString(imm_context, GCS_CURSORPOS, NULL, 0);
++    composition->selection = gfx::Range(cursor);
++  } else {
++    composition->selection = gfx::Range(0);
++  }
++
++  // Retrieve the clause segmentations and convert them to ime_text_spans.
++  if (lparam & GCS_COMPCLAUSE) {
++    GetImeTextSpans(imm_context, target_start, target_end,
++                    &composition->ime_text_spans);
++  }
++
++  // Set default composition underlines in case there is no clause information.
++  if (!composition->ime_text_spans.empty())
++    return;
++
++  ImeTextSpan ime_text_span;
++  ime_text_span.underline_color = SK_ColorTRANSPARENT;
++  ime_text_span.background_color = SK_ColorTRANSPARENT;
++  if (target_start > 0) {
++    ime_text_span.start_offset = 0U;
++    ime_text_span.end_offset = static_cast<uint32_t>(target_start);
++    ime_text_span.thickness = ui::ImeTextSpan::Thickness::kThin;
++    composition->ime_text_spans.push_back(ime_text_span);
++  }
++  if (target_end > target_start) {
++    ime_text_span.start_offset = static_cast<uint32_t>(target_start);
++    ime_text_span.end_offset = static_cast<uint32_t>(target_end);
++    ime_text_span.thickness = ui::ImeTextSpan::Thickness::kThick;
++    composition->ime_text_spans.push_back(ime_text_span);
++  }
++  if (target_end < length) {
++    ime_text_span.start_offset = static_cast<uint32_t>(target_end);
++    ime_text_span.end_offset = static_cast<uint32_t>(length);
++    ime_text_span.thickness = ui::ImeTextSpan::Thickness::kThin;
++    composition->ime_text_spans.push_back(ime_text_span);
++  }
++}
++
++bool IMM32Manager::GetString(HIMC imm_context,
++                             WPARAM lparam,
++                             int type,
++                             std::u16string* result) {
++  if (!(lparam & type))
++    return false;
++  LONG string_size = ::ImmGetCompositionString(imm_context, type, NULL, 0);
++  if (string_size <= 0)
++    return false;
++  DCHECK_EQ(0u, string_size % sizeof(wchar_t));
++  ::ImmGetCompositionString(imm_context, type,
++                            base::as_writable_wcstr(base::WriteInto(
++                                result, (string_size / sizeof(wchar_t)) + 1)),
++                            string_size);
++  return true;
++}
++
++bool IMM32Manager::GetResult(HWND window_handle,
++                             LPARAM lparam,
++                             std::u16string* result) {
++  bool ret = false;
++  HIMC imm_context = ::ImmGetContext(window_handle);
++  if (imm_context) {
++    ret = GetString(imm_context, lparam, GCS_RESULTSTR, result);
++    ::ImmReleaseContext(window_handle, imm_context);
++  }
++  return ret;
++}
++
++bool IMM32Manager::GetComposition(HWND window_handle, LPARAM lparam,
++                              CompositionText* composition) {
++  bool ret = false;
++  HIMC imm_context = ::ImmGetContext(window_handle);
++  if (imm_context) {
++    // Copy the composition string to the CompositionText object.
++    ret = GetString(imm_context, lparam, GCS_COMPSTR, &composition->text);
++
++    if (ret) {
++      // This is a dirty workaround for facebook. Facebook deletes the
++      // placeholder character (U+3000) used by Traditional-Chinese IMEs at the
++      // beginning of composition text. This prevents WebKit from replacing this
++      // placeholder character with a Traditional-Chinese character, i.e. we
++      // cannot input any characters in a comment box of facebook with
++      // Traditional-Chinese IMEs. As a workaround, we replace U+3000 at the
++      // beginning of composition text with U+FF3F, a placeholder character used
++      // by Japanese IMEs.
++      if (input_language_id_ == MAKELANGID(LANG_CHINESE,
++                                           SUBLANG_CHINESE_TRADITIONAL) &&
++          composition->text[0] == 0x3000) {
++        composition->text[0] = 0xFF3F;
++      }
++
++      // Retrieve the IME text spans and selection range information.
++      GetCompositionInfo(imm_context, lparam, composition);
++
++      // Mark that there is an ongoing composition.
++      is_composing_ = true;
++    }
++
++    ::ImmReleaseContext(window_handle, imm_context);
++  }
++  return ret;
++}
++
++void IMM32Manager::DisableIME(HWND window_handle) {
++  // A renderer process have moved its input focus to a password input
++  // when there is an ongoing composition, e.g. a user has clicked a
++  // mouse button and selected a password input while composing a text.
++  // For this case, we have to complete the ongoing composition and
++  // clean up the resources attached to this object BEFORE DISABLING THE IME.
++  CleanupComposition(window_handle);
++  ::ImmAssociateContextEx(window_handle, NULL, 0);
++}
++
++void IMM32Manager::CancelIME(HWND window_handle) {
++  if (is_composing_) {
++    HIMC imm_context = ::ImmGetContext(window_handle);
++    if (imm_context) {
++      ::ImmNotifyIME(imm_context, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
++      ::ImmReleaseContext(window_handle, imm_context);
++    }
++    ResetComposition(window_handle);
++  }
++}
++
++void IMM32Manager::EnableIME(HWND window_handle) {
++  // Load the default IME context.
++  // NOTE(hbono)
++  //   IMM ignores this call if the IME context is loaded. Therefore, we do
++  //   not have to check whether or not the IME context is loaded.
++  ::ImmAssociateContextEx(window_handle, NULL, IACE_DEFAULT);
++}
++
++void IMM32Manager::UpdateCaretRect(HWND window_handle,
++                               const gfx::Rect& caret_rect) {
++  // Save the caret position, and Update the position of the IME window.
++  // This update is used for moving an IME window when a renderer process
++  // resize/moves the input caret.
++  if (caret_rect_ != caret_rect) {
++    caret_rect_ = caret_rect;
++    // Move the IME windows.
++    HIMC imm_context = ::ImmGetContext(window_handle);
++    if (imm_context) {
++      MoveImeWindow(window_handle, imm_context);
++      ::ImmReleaseContext(window_handle, imm_context);
++    }
++  }
++}
++
++void IMM32Manager::SetUseCompositionWindow(bool use_composition_window) {
++  use_composition_window_ = use_composition_window;
++}
++
++bool IMM32Manager::IsInputLanguageCJK() const {
++  LANGID lang = PRIMARYLANGID(input_language_id_);
++  return lang == LANG_CHINESE || lang == LANG_JAPANESE ||
++      lang == LANG_KOREAN;
++}
++
++void IMM32Manager::SetTextInputMode(HWND window_handle,
++                                    TextInputMode input_mode) {
++  if (input_mode == ui::TEXT_INPUT_MODE_DEFAULT)
++    return;
++
++  const HIMC imm_context = ::ImmGetContext(window_handle);
++  if (!imm_context)
++    return;
++
++  DWORD conversion_mode = 0;
++  DWORD sentence_mode = 0;
++  if (::ImmGetConversionStatus(imm_context, &conversion_mode, &sentence_mode)
++      == FALSE) {
++    return;
++  }
++
++  BOOL open = FALSE;
++  ConvertInputModeToImmFlags(input_mode, conversion_mode, &open,
++                             &conversion_mode),
++
++  ::ImmSetOpenStatus(imm_context, open);
++  if (open)
++    ::ImmSetConversionStatus(imm_context, conversion_mode, sentence_mode);
++  ::ImmReleaseContext(window_handle, imm_context);
++}
++
++// static
++void IMM32Manager::ConvertInputModeToImmFlags(TextInputMode input_mode,
++                                              DWORD initial_conversion_mode,
++                                              BOOL* open,
++                                              DWORD* new_conversion_mode) {
++  *open = FALSE;
++  *new_conversion_mode = initial_conversion_mode;
++}
++
++}  // namespace ui
+diff --git a/ui/base/ime/win/imm32_manager.h b/ui/base/ime/win/imm32_manager.h
+new file mode 100644
+index 0000000..e8271a9
+--- /dev/null
++++ b/ui/base/ime/win/imm32_manager.h
+@@ -0,0 +1,308 @@
++// Copyright 2013 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef UI_BASE_IME_WIN_IMM32_MANAGER_H_
++#define UI_BASE_IME_WIN_IMM32_MANAGER_H_
++
++#include <windows.h>
++
++#include <string>
++#include <vector>
++
++#include "base/component_export.h"
++#include "base/i18n/rtl.h"
++#include "ui/base/ime/text_input_mode.h"
++#include "ui/gfx/geometry/rect.h"
++
++namespace ui {
++
++struct CompositionText;
++
++// This header file defines a struct and a class used for encapsulating IMM32
++// APIs, controls IMEs attached to a window, and enables the 'on-the-spot'
++// input without deep knowledge about the APIs, i.e. knowledge about the
++// language-specific and IME-specific behaviors.
++// The following items enumerates the simplest steps for an (window)
++// application to control its IMEs with the struct and the class defined
++// this file.
++// 1. Add an instance of the IMM32Manager class to its window class.
++//    (The IMM32Manager class needs a window handle.)
++// 2. Add messages handlers listed in the following subsections, follow the
++//    instructions written in each subsection, and use the IMM32Manager class.
++// 2.1. WM_IME_SETCONTEXT (0x0281)
++//      Call the functions listed below:
++//      - IMM32Manager::CreateImeWindow();
++//      - IMM32Manager::CleanupComposition(), and;
++//      - IMM32Manager::SetImeWindowStyle().
++//      An application MUST prevent from calling ::DefWindowProc().
++// 2.2. WM_IME_STARTCOMPOSITION (0x010D)
++//      Call the functions listed below:
++//      - IMM32Manager::CreateImeWindow(), and;
++//      - IMM32Manager::ResetComposition().
++//      An application MUST prevent from calling ::DefWindowProc().
++// 2.3. WM_IME_COMPOSITION (0x010F)
++//      Call the functions listed below:
++//      - IMM32Manager::UpdateImeWindow();
++//      - IMM32Manager::GetResult();
++//      - IMM32Manager::GetComposition(), and;
++//      - IMM32Manager::ResetComposition() (optional).
++//      An application MUST prevent from calling ::DefWindowProc().
++// 2.4. WM_IME_ENDCOMPOSITION (0x010E)
++//      Call the functions listed below:
++//      - IMM32Manager::ResetComposition(), and;
++//      - IMM32Manager::DestroyImeWindow().
++//      An application CAN call ::DefWindowProc().
++// 2.5. WM_INPUTLANGCHANGE (0x0051)
++//      Call the functions listed below:
++//      - IMM32Manager::SetInputLanguage().
++//      An application CAN call ::DefWindowProc().
++
++// This class controls the IMM (Input Method Manager) through IMM32 APIs and
++// enables it to retrieve the string being controled by the IMM. (I wrote
++// a note to describe the reason why I do not use 'IME' but 'IMM' below.)
++// NOTE(hbono):
++//   Fortunately or unfortunately, TSF (Text Service Framework) and
++//   CUAS (Cicero Unaware Application Support) allows IMM32 APIs for
++//   retrieving not only the inputs from IMEs (Input Method Editors), used
++//   only for inputting East-Asian language texts, but also the ones from
++//   tablets (on Windows XP Tablet PC Edition and Windows Vista), voice
++//   recognizers (e.g. ViaVoice and Microsoft Office), etc.
++//   We can disable TSF and CUAS in Windows XP Tablet PC Edition. On the other
++//   hand, we can NEVER disable either TSF or CUAS in Windows Vista, i.e.
++//   THIS CLASS IS NOT ONLY USED ON THE INPUT CONTEXTS OF EAST-ASIAN
++//   LANGUAGES BUT ALSO USED ON THE INPUT CONTEXTS OF ALL LANGUAGES.
++class COMPONENT_EXPORT(UI_BASE_IME_WIN) IMM32Manager {
++ public:
++  IMM32Manager();
++
++  IMM32Manager(const IMM32Manager&) = delete;
++  IMM32Manager& operator=(const IMM32Manager&) = delete;
++
++  virtual ~IMM32Manager();
++
++  // Retrieves whether or not there is an ongoing composition.
++  bool is_composing() const { return is_composing_; }
++
++  // Retrieves the input language from Windows and update it.
++  void SetInputLanguage();
++
++  // Creates the IME windows, and allocate required resources for them.
++  // Parameters
++  //   * window_handle [in] (HWND)
++  //     Represents the window handle of the caller.
++  void CreateImeWindow(HWND window_handle);
++
++  // Updates the style of the IME windows.
++  // Parameters
++  //   * window_handle [in] (HWND)
++  //     Represents the window handle of the caller.
++  //   * message [in] (UINT)
++  //   * wparam [in] (WPARAM)
++  //   * lparam [in] (LPARAM)
++  //     Represent the windows message of the caller.
++  //     These parameters are used for verifying if this function is called
++  //     in a handler function for WM_IME_SETCONTEXT messages because this
++  //     function uses ::DefWindowProc() to update the style.
++  //     A caller just has to pass the input parameters for the handler
++  //     function without modifications.
++  //   * handled [out] (BOOL*)
++  //     Returns ::DefWindowProc() is really called in this function.
++  //     PLEASE DO NOT CALL ::DefWindowProc() IF THIS VALUE IS TRUE!
++  //     All the window styles set in this function are over-written when
++  //     calling ::DefWindowProc() after returning this function.
++  // Returns the value returned by DefWindowProc.
++  LRESULT SetImeWindowStyle(HWND window_handle, UINT message,
++                            WPARAM wparam, LPARAM lparam, BOOL* handled);
++
++  // Destroys the IME windows and all the resources attached to them.
++  // Parameters
++  //   * window_handle [in] (HWND)
++  //     Represents the window handle of the caller.
++  void DestroyImeWindow(HWND window_handle);
++
++  // Updates the position of the IME windows.
++  // Parameters
++  //   * window_handle [in] (HWND)
++  //     Represents the window handle of the caller.
++  void UpdateImeWindow(HWND window_handle);
++
++  // Cleans up the all resources attached to the given IMM32Manager object, and
++  // reset its composition status.
++  // Parameters
++  //   * window_handle [in] (HWND)
++  //     Represents the window handle of the caller.
++  void CleanupComposition(HWND window_handle);
++
++  // Resets the composition status.
++  // Cancel the ongoing composition if it exists.
++  // NOTE(hbono): This method does not release the allocated resources.
++  // Parameters
++  //   * window_handle [in] (HWND)
++  //     Represents the window handle of the caller.
++  void ResetComposition(HWND window_handle);
++
++  // Retrieves a composition result of the ongoing composition if it exists.
++  // Parameters
++  //   * window_handle [in] (HWND)
++  //     Represents the window handle of the caller.
++  //   * lparam [in] (LPARAM)
++  //     Specifies the updated members of the ongoing composition, and must be
++  //     the same parameter of a WM_IME_COMPOSITION message handler.
++  //     This parameter is used for checking if the ongoing composition has
++  //     its result string,
++  //   * result [out] (std::u16string)
++  //     Represents the object contains the composition result.
++  // Return values
++  //   * true
++  //     The ongoing composition has a composition result.
++  //   * false
++  //     The ongoing composition does not have composition results.
++  // Remarks
++  //   This function is designed for being called from WM_IME_COMPOSITION
++  //   message handlers.
++  bool GetResult(HWND window_handle, LPARAM lparam, std::u16string* result);
++
++  // Retrieves the current composition status of the ongoing composition.
++  // Parameters
++  //   * window_handle [in] (HWND)
++  //     Represents the window handle of the caller.
++  //   * lparam [in] (LPARAM)
++  //     Specifies the updated members of the ongoing composition, and must be
++  //     the same parameter of a WM_IME_COMPOSITION message handler.
++  //     This parameter is used for checking if the ongoing composition has
++  //     its result string,
++  //   * composition [out] (Composition)
++  //     Represents the struct contains the composition status.
++  // Return values
++  //   * true
++  //     The status of the ongoing composition is updated.
++  //   * false
++  //     The status of the ongoing composition is not updated.
++  // Remarks
++  //   This function is designed for being called from WM_IME_COMPOSITION
++  //   message handlers.
++  bool GetComposition(HWND window_handle, LPARAM lparam,
++                      CompositionText* composition);
++
++  // Enables the IME attached to the given window, i.e. allows user-input
++  // events to be dispatched to the IME.
++  // Parameters
++  //   * window_handle [in] (HWND)
++  //     Represents the window handle of the caller.
++  //   * complete [in] (bool)
++  //     Represents whether or not to complete the ongoing composition.
++  //     + true
++  //       After finishing the ongoing composition and close its IME windows,
++  //       start another composition and display its IME windows to the given
++  //       position.
++  //     + false
++  //       Just move the IME windows of the ongoing composition to the given
++  //       position without finishing it.
++  void EnableIME(HWND window_handle);
++
++  // Disables the IME attached to the given window, i.e. prohibits any
++  // user-input events from being dispatched to the IME.
++  // In Chrome, this function is used when:
++  //   * a renreder process sets its input focus to a password input.
++  // Parameters
++  //   * window_handle [in] (HWND)
++  //     Represents the window handle of the caller.
++  void DisableIME(HWND window_handle);
++
++  // Cancels an ongoing composition of the IME attached to the given window.
++  // Parameters
++  //   * window_handle [in] (HWND)
++  //     Represents the window handle of the caller.
++  void CancelIME(HWND window_handle);
++
++  // Updates the caret position of the given window.
++  // Parameters
++  //   * window_handle [in] (HWND)
++  //     Represents the window handle of the caller.
++  //   * caret_rect [in] (const gfx::Rect&)
++  //     Represent the rectangle of the input caret.
++  //     This rectangle is used for controlling the positions of IME windows.
++  void UpdateCaretRect(HWND window_handle, const gfx::Rect& caret_rect);
++
++  // Updates the setting whether we want IME to render composition text.
++  void SetUseCompositionWindow(bool use_composition_window);
++
++  // Returns the current input language id.
++  LANGID input_language_id() const { return input_language_id_; }
++
++  // Returns whether the system's input language is CJK.
++  bool IsInputLanguageCJK() const;
++
++  // Sets conversion status corresponding to |input_mode|.
++  virtual void SetTextInputMode(HWND window_handle, TextInputMode input_mode);
++
++  // Helper functions ----------------------------------------------------------
++
++  // Gets parameters for ::ImmSetOpenStatus and ::ImmSetConversionStatus from
++  // |input_mode|.
++  static void ConvertInputModeToImmFlags(TextInputMode input_mode,
++                                         DWORD initial_conversion_mode,
++                                         BOOL* open,
++                                         DWORD* new_conversion_mode);
++
++ protected:
++  // Retrieves the composition information.
++  void GetCompositionInfo(HIMC imm_context, LPARAM lparam,
++                          CompositionText* composition);
++
++  // Updates the position of the IME windows.
++  void MoveImeWindow(HWND window_handle, HIMC imm_context);
++
++  // Completes the ongoing composition if it exists.
++  void CompleteComposition(HWND window_handle, HIMC imm_context);
++
++  // Retrieves a string from the IMM.
++  bool GetString(HIMC imm_context,
++                 WPARAM lparam,
++                 int type,
++                 std::u16string* result);
++
++ private:
++  // Represents whether or not there is an ongoing composition in a browser
++  // process, i.e. whether or not a browser process is composing a text.
++  bool is_composing_;
++
++  // The current input Language ID retrieved from Windows, which consists of:
++  //   * Primary Language ID (bit 0 to bit 9), which shows a natunal language
++  //     (English, Korean, Chinese, Japanese, etc.) and;
++  //   * Sub-Language ID (bit 10 to bit 15), which shows a geometrical region
++  //     the language is spoken (For English, United States, United Kingdom,
++  //     Australia, Canada, etc.)
++  // The following list enumerates some examples for the Language ID:
++  //   * "en-US" (0x0409)
++  //     MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US);
++  //   * "ko-KR" (0x0412)
++  //     MAKELANGID(LANG_KOREAN,  SUBLANG_KOREAN);
++  //   * "zh-TW" (0x0404)
++  //     MAKELANGID(LANG_CHINESE, SUBLANG_CHINESE_TRADITIONAL);
++  //   * "zh-CN" (0x0804)
++  //     MAKELANGID(LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED);
++  //   * "ja-JP" (0x0411)
++  //     MAKELANGID(LANG_JAPANESE, SUBLANG_JAPANESE_JAPAN), etc.
++  //   (See <winnt.h> for other available values.)
++  // This Language ID is used for processing language-specific operations in
++  // IME functions.
++  LANGID input_language_id_;
++
++  // Represents whether or not the current input context has created a system
++  // caret to set the position of its IME candidate window.
++  //   * true: it creates a system caret.
++  //   * false: it does not create a system caret.
++  bool system_caret_;
++
++  // The rectangle of the input caret retrieved from a renderer process.
++  gfx::Rect caret_rect_;
++
++  // Indicates whether or not we want IME to render composition text.
++  bool use_composition_window_;
++};
++
++}  // namespace ui
++
++#endif  // UI_BASE_IME_WIN_IMM32_MANAGER_H_
+diff --git a/ui/base/ime/win/input_method_win_imm32.cc b/ui/base/ime/win/input_method_win_imm32.cc
+new file mode 100644
+index 0000000..ccc5bad
+--- /dev/null
++++ b/ui/base/ime/win/input_method_win_imm32.cc
+@@ -0,0 +1,353 @@
++// Copyright 2012 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "ui/base/ime/win/input_method_win_imm32.h"
++
++#include <stddef.h>
++#include <stdint.h>
++
++#include "base/auto_reset.h"
++#include "base/command_line.h"
++#include "base/functional/bind.h"
++#include "ui/base/ime/text_input_client.h"
++#include "ui/base/ime/win/tsf_input_scope.h"
++#include "ui/display/win/screen_win.h"
++#include "ui/events/event.h"
++#include "ui/events/event_constants.h"
++#include "ui/events/event_utils.h"
++#include "ui/events/keycodes/keyboard_codes.h"
++#include "ui/gfx/win/hwnd_util.h"
++
++namespace ui {
++
++InputMethodWinImm32::InputMethodWinImm32(
++    ImeKeyEventDispatcher* ime_key_event_dispatcher,
++    HWND attached_window_handle)
++    : InputMethodWinBase(ime_key_event_dispatcher, attached_window_handle),
++
++      enabled_(false),
++      is_candidate_popup_open_(false),
++      composing_window_handle_(NULL) {
++  imm32_manager_.SetInputLanguage();
++}
++
++InputMethodWinImm32::~InputMethodWinImm32() {}
++
++void InputMethodWinImm32::OnFocus() {
++  InputMethodBase::OnFocus();
++  RefreshInputLanguage();
++}
++
++bool InputMethodWinImm32::OnUntranslatedIMEMessage(
++    const CHROME_MSG event,
++    InputMethod::NativeEventResult* result) {
++  LRESULT original_result = 0;
++  BOOL handled = FALSE;
++
++  switch (event.message) {
++    case WM_IME_SETCONTEXT:
++      original_result = OnImeSetContext(event.hwnd, event.message, event.wParam,
++                                        event.lParam, &handled);
++      break;
++    case WM_IME_STARTCOMPOSITION:
++      original_result = OnImeStartComposition(
++          event.hwnd, event.message, event.wParam, event.lParam, &handled);
++      break;
++    case WM_IME_COMPOSITION:
++      original_result = OnImeComposition(event.hwnd, event.message,
++                                         event.wParam, event.lParam, &handled);
++      break;
++    case WM_IME_ENDCOMPOSITION:
++      original_result = OnImeEndComposition(
++          event.hwnd, event.message, event.wParam, event.lParam, &handled);
++      break;
++    case WM_IME_REQUEST:
++      original_result =
++          OnImeRequest(event.message, event.wParam, event.lParam, &handled);
++      break;
++    case WM_CHAR:
++    case WM_SYSCHAR:
++      original_result = OnChar(event.hwnd, event.message, event.wParam,
++                               event.lParam, event, &handled);
++      break;
++    case WM_IME_NOTIFY:
++      original_result =
++          OnImeNotify(event.message, event.wParam, event.lParam, &handled);
++      break;
++    default:
++      NOTREACHED() << "Unknown IME message:" << event.message;
++  }
++  if (result)
++    *result = original_result;
++  return !!handled;
++}
++
++void InputMethodWinImm32::OnTextInputTypeChanged(TextInputClient* client) {
++  InputMethodBase::OnTextInputTypeChanged(client);
++  if (!IsTextInputClientFocused(client) || !IsWindowFocused(client))
++    return;
++  imm32_manager_.CancelIME(attached_window_handle_);
++  UpdateIMEState();
++}
++
++void InputMethodWinImm32::OnCaretBoundsChanged(const TextInputClient* client) {
++  if (!IsTextInputClientFocused(client) || !IsWindowFocused(client))
++    return;
++  NotifyTextInputCaretBoundsChanged(client);
++  if (!enabled_)
++    return;
++
++  // The current text input type should not be NONE if |client| is focused.
++  DCHECK(!IsTextInputTypeNone());
++  // Tentatively assume that the returned value is DIP (Density Independent
++  // Pixel). See the comment in text_input_client.h and http://crbug.com/360334.
++  const gfx::Rect dip_screen_bounds(GetTextInputClient()->GetCaretBounds());
++  const gfx::Rect screen_bounds =
++      display::win::GetScreenWin()->DIPToScreenRect(attached_window_handle_,
++                                                    dip_screen_bounds);
++
++  HWND attached_window = attached_window_handle_;
++  // TODO(ime): see comment in TextInputClient::GetCaretBounds(), this
++  // conversion shouldn't be necessary.
++  RECT r = {};
++  GetClientRect(attached_window, &r);
++  POINT window_point = {screen_bounds.x(), screen_bounds.y()};
++  ScreenToClient(attached_window, &window_point);
++  gfx::Rect caret_rect(gfx::Point(window_point.x, window_point.y),
++                       screen_bounds.size());
++  imm32_manager_.UpdateCaretRect(attached_window, caret_rect);
++}
++
++void InputMethodWinImm32::CancelComposition(const TextInputClient* client) {
++  if (IsTextInputClientFocused(client) && enabled_) {
++    imm32_manager_.CancelIME(attached_window_handle_);
++  }
++}
++
++void InputMethodWinImm32::OnInputLocaleChanged() {
++  // Note: OnInputLocaleChanged() is for capturing the input language which can
++  // be used to determine the appropriate TextInputType for Omnibox.
++  // See https://crbug.com/344834.
++  // Currently OnInputLocaleChanged() on Windows relies on WM_INPUTLANGCHANGED,
++  // which is known to be incompatible with TSF.
++  // TODO(shuchen): Use ITfLanguageProfileNotifySink instead.
++  OnInputMethodChanged();
++  RefreshInputLanguage();
++}
++
++bool InputMethodWinImm32::IsInputLocaleCJK() const {
++  return imm32_manager_.IsInputLanguageCJK();
++}
++
++bool InputMethodWinImm32::IsCandidatePopupOpen() const {
++  return is_candidate_popup_open_;
++}
++
++void InputMethodWinImm32::OnWillChangeFocusedClient(
++    TextInputClient* focused_before,
++    TextInputClient* focused) {
++  if (IsWindowFocused(focused_before))
++    ConfirmCompositionText();
++}
++
++void InputMethodWinImm32::OnDidChangeFocusedClient(
++    TextInputClient* focused_before,
++    TextInputClient* focused) {
++  if (IsWindowFocused(focused)) {
++    // Force to update the input type since client's TextInputStateChanged()
++    // function might not be called if text input types before the client loses
++    // focus and after it acquires focus again are the same.
++    OnTextInputTypeChanged(focused);
++
++    // Force to update caret bounds, in case the client thinks that the caret
++    // bounds has not changed.
++    OnCaretBoundsChanged(focused);
++  }
++  InputMethodWinBase::OnDidChangeFocusedClient(focused_before, focused);
++}
++
++LRESULT InputMethodWinImm32::OnImeSetContext(HWND window_handle,
++                                             UINT message,
++                                             WPARAM wparam,
++                                             LPARAM lparam,
++                                             BOOL* handled) {
++  if (!!wparam) {
++    imm32_manager_.CreateImeWindow(window_handle);
++    // Delay initialize the tsf to avoid perf regression.
++    // Loading tsf dll causes some time, so doing it in UpdateIMEState() will
++    // slow down the browser window creation.
++    // See https://crbug.com/509984.
++    tsf_inputscope::InitializeTsfForInputScopes();
++    tsf_inputscope::SetInputScopeForTsfUnawareWindow(
++        attached_window_handle_, GetTextInputType(), GetTextInputMode());
++  }
++
++  OnInputMethodChanged();
++  return imm32_manager_.SetImeWindowStyle(window_handle, message, wparam,
++                                          lparam, handled);
++}
++
++LRESULT InputMethodWinImm32::OnImeStartComposition(HWND window_handle,
++                                                   UINT message,
++                                                   WPARAM wparam,
++                                                   LPARAM lparam,
++                                                   BOOL* handled) {
++  // We have to prevent WTL from calling ::DefWindowProc() because the function
++  // calls ::ImmSetCompositionWindow() and ::ImmSetCandidateWindow() to
++  // over-write the position of IME windows.
++  *handled = TRUE;
++
++  // Reset the composition status and create IME windows.
++  composing_window_handle_ = window_handle;
++  imm32_manager_.CreateImeWindow(window_handle);
++  imm32_manager_.ResetComposition(window_handle);
++  return 0;
++}
++
++LRESULT InputMethodWinImm32::OnImeComposition(HWND window_handle,
++                                              UINT message,
++                                              WPARAM wparam,
++                                              LPARAM lparam,
++                                              BOOL* handled) {
++  // We have to prevent WTL from calling ::DefWindowProc() because we do not
++  // want for the IMM (Input Method Manager) to send WM_IME_CHAR messages.
++  *handled = TRUE;
++
++  // At first, update the position of the IME window.
++  imm32_manager_.UpdateImeWindow(window_handle);
++
++  // Retrieve the result string and its attributes of the ongoing composition
++  // and send it to a renderer process.
++  ui::CompositionText composition;
++  if (imm32_manager_.GetResult(window_handle, lparam, &composition.text)) {
++    if (!IsTextInputTypeNone())
++      GetTextInputClient()->InsertText(
++          composition.text,
++          ui::TextInputClient::InsertTextCursorBehavior::kMoveCursorAfterText);
++    imm32_manager_.ResetComposition(window_handle);
++    // Fall though and try reading the composition string.
++    // Japanese IMEs send a message containing both GCS_RESULTSTR and
++    // GCS_COMPSTR, which means an ongoing composition has been finished
++    // by the start of another composition.
++  }
++  // Retrieve the composition string and its attributes of the ongoing
++  // composition and send it to a renderer process.
++  if (imm32_manager_.GetComposition(window_handle, lparam, &composition) &&
++      !IsTextInputTypeNone())
++    GetTextInputClient()->SetCompositionText(composition);
++
++  return 0;
++}
++
++LRESULT InputMethodWinImm32::OnImeEndComposition(HWND window_handle,
++                                                 UINT message,
++                                                 WPARAM wparam,
++                                                 LPARAM lparam,
++                                                 BOOL* handled) {
++  // Let WTL call ::DefWindowProc() and release its resources.
++  *handled = FALSE;
++
++  composing_window_handle_ = NULL;
++
++  // This is a hack fix for MS Korean IME issue (https://crbug.com/647150).
++  // Messages received when hitting Space key during composition:
++  //   1. WM_IME_ENDCOMPOSITION (we usually clear composition for this MSG)
++  //   2. WM_IME_COMPOSITION with GCS_RESULTSTR (we usually commit composition)
++  // (Which is in the reversed order compared to MS Japanese and Chinese IME.)
++  // Hack fix:
++  //   * Discard WM_IME_ENDCOMPOSITION message if it's followed by a
++  //     WM_IME_COMPOSITION message with GCS_RESULTSTR.
++  // This works because we don't require WM_IME_ENDCOMPOSITION after committing
++  // composition (it doesn't do anything if there is no on-going composition).
++  // Also see Firefox's implementation:
++  // https://dxr.mozilla.org/mozilla-beta/source/widget/windows/IMMHandler.cpp#800
++  // TODO(crbug.com/654865): Further investigations and clean-ups required.
++  CHROME_MSG compositionMsg;
++  if (::PeekMessage(ChromeToWindowsType(&compositionMsg), window_handle,
++                    WM_IME_STARTCOMPOSITION, WM_IME_COMPOSITION, PM_NOREMOVE) &&
++      compositionMsg.message == WM_IME_COMPOSITION &&
++      (compositionMsg.lParam & GCS_RESULTSTR))
++    return 0;
++
++  if (!IsTextInputTypeNone() && GetTextInputClient()->HasCompositionText())
++    GetTextInputClient()->ClearCompositionText();
++
++  imm32_manager_.ResetComposition(window_handle);
++  imm32_manager_.DestroyImeWindow(window_handle);
++  return 0;
++}
++
++LRESULT InputMethodWinImm32::OnImeNotify(UINT message,
++                                         WPARAM wparam,
++                                         LPARAM lparam,
++                                         BOOL* handled) {
++  *handled = FALSE;
++
++  // Update |is_candidate_popup_open_|, whether a candidate window is open.
++  switch (wparam) {
++    case IMN_OPENCANDIDATE:
++      is_candidate_popup_open_ = true;
++      break;
++    case IMN_CLOSECANDIDATE:
++      is_candidate_popup_open_ = false;
++      break;
++  }
++
++  return 0;
++}
++
++void InputMethodWinImm32::RefreshInputLanguage() {
++  TextInputType type_original = GetTextInputType();
++  imm32_manager_.SetInputLanguage();
++  if (type_original != GetTextInputType()) {
++    // Only update the IME state when necessary.
++    // It's unnecessary to report IME state, when:
++    // 1) Switching betweeen 2 top-level windows, and the switched-away window
++    //    receives OnInputLocaleChanged.
++    // 2) The text input type is not changed by |SetInputLanguage|.
++    // Please refer to https://crbug.com/679564.
++    UpdateIMEState();
++  }
++}
++
++void InputMethodWinImm32::ConfirmCompositionText() {
++  // Makes sure the native IME app can be informed about the composition is
++  // cleared, so that it can clean up its internal states.
++  if (composing_window_handle_)
++    imm32_manager_.CleanupComposition(composing_window_handle_);
++}
++
++TextInputMode InputMethodWinImm32::GetTextInputMode() const {
++  TextInputClient* client = GetTextInputClient();
++  return client ? client->GetTextInputMode() : TEXT_INPUT_MODE_DEFAULT;
++}
++
++void InputMethodWinImm32::UpdateIMEState() {
++  // Use switch here in case we are going to add more text input types.
++  // We disable input method in password field.
++  const HWND window_handle = attached_window_handle_;
++  const TextInputType text_input_type = GetTextInputType();
++  const TextInputMode text_input_mode = GetTextInputMode();
++  switch (text_input_type) {
++    case ui::TEXT_INPUT_TYPE_NONE:
++    case ui::TEXT_INPUT_TYPE_PASSWORD:
++      imm32_manager_.DisableIME(window_handle);
++      enabled_ = false;
++      break;
++    default:
++      imm32_manager_.EnableIME(window_handle);
++      enabled_ = true;
++      break;
++  }
++
++  imm32_manager_.SetTextInputMode(window_handle, text_input_mode);
++  tsf_inputscope::SetInputScopeForTsfUnawareWindow(
++      window_handle, text_input_type, text_input_mode);
++}
++
++void InputMethodWinImm32::OnUrlChanged() {
++  // Only the TSF bridge consumes URL changes; IMM32 has nothing to update.
++}
++
++}  // namespace ui
+diff --git a/ui/base/ime/win/input_method_win_imm32.h b/ui/base/ime/win/input_method_win_imm32.h
+new file mode 100644
+index 0000000..1a82c4d
+--- /dev/null
++++ b/ui/base/ime/win/input_method_win_imm32.h
+@@ -0,0 +1,105 @@
++// Copyright 2011 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef UI_BASE_IME_WIN_INPUT_METHOD_WIN_IMM32_H_
++#define UI_BASE_IME_WIN_INPUT_METHOD_WIN_IMM32_H_
++
++#include <windows.h>
++
++#include "base/component_export.h"
++#include "ui/base/ime/win/imm32_manager.h"
++#include "ui/base/ime/win/input_method_win_base.h"
++
++namespace ui {
++
++// A common InputMethod implementation based on IMM32.
++class COMPONENT_EXPORT(UI_BASE_IME_WIN) InputMethodWinImm32
++    : public InputMethodWinBase {
++ public:
++  InputMethodWinImm32(ImeKeyEventDispatcher* ime_key_event_dispatcher,
++                      HWND attached_window_handle);
++
++  InputMethodWinImm32(const InputMethodWinImm32&) = delete;
++  InputMethodWinImm32& operator=(const InputMethodWinImm32&) = delete;
++
++  ~InputMethodWinImm32() override;
++
++  // Overridden from InputMethodBase:
++  void OnFocus() override;
++
++  // Overridden from InputMethod:
++  bool OnUntranslatedIMEMessage(const CHROME_MSG event,
++                                NativeEventResult* result) override;
++  void OnTextInputTypeChanged(TextInputClient* client) override;
++  void OnCaretBoundsChanged(const TextInputClient* client) override;
++  void CancelComposition(const TextInputClient* client) override;
++  void OnInputLocaleChanged() override;
++  bool IsInputLocaleCJK() const override;
++  bool IsCandidatePopupOpen() const override;
++  void OnUrlChanged() override;
++
++ protected:
++  // Overridden from InputMethodBase:
++  // If a derived class overrides this method, it should call parent's
++  // implementation.
++  void OnWillChangeFocusedClient(TextInputClient* focused_before,
++                                 TextInputClient* focused) override;
++  void OnDidChangeFocusedClient(TextInputClient* focused_before,
++                                TextInputClient* focused) override;
++
++ private:
++  LRESULT OnImeSetContext(HWND window_handle,
++                          UINT message,
++                          WPARAM wparam,
++                          LPARAM lparam,
++                          BOOL* handled);
++  LRESULT OnImeStartComposition(HWND window_handle,
++                                UINT message,
++                                WPARAM wparam,
++                                LPARAM lparam,
++                                BOOL* handled);
++  LRESULT OnImeComposition(HWND window_handle,
++                           UINT message,
++                           WPARAM wparam,
++                           LPARAM lparam,
++                           BOOL* handled);
++  LRESULT OnImeEndComposition(HWND window_handle,
++                              UINT message,
++                              WPARAM wparam,
++                              LPARAM lparam,
++                              BOOL* handled);
++  LRESULT OnImeNotify(UINT message,
++                      WPARAM wparam,
++                      LPARAM lparam,
++                      BOOL* handled);
++
++  void RefreshInputLanguage();
++
++  // Enables or disables the IME according to the current text input type.
++  void UpdateIMEState();
++
++  void ConfirmCompositionText();
++
++  // Gets the text input mode of the focused text input client. Returns
++  // ui::TEXT_INPUT_MODE_DEFAULT if there is no focused client.
++  TextInputMode GetTextInputMode() const;
++
++  // Windows IMM32 wrapper.
++  // (See "ui/base/ime/win/ime_input.h" for its details.)
++  ui::IMM32Manager imm32_manager_;
++
++  // True when an IME should be allowed to process key events.
++  bool enabled_;
++
++  // True if we know for sure that a candidate window is open.
++  bool is_candidate_popup_open_;
++
++  // Window handle where composition is on-going. NULL when there is no
++  // composition.
++  HWND composing_window_handle_;
++};
++
++}  // namespace ui
++
++#endif  // UI_BASE_IME_WIN_INPUT_METHOD_WIN_IMM32_H_
+diff --git a/ui/base/ime/win/tsf_bridge.cc b/ui/base/ime/win/tsf_bridge.cc
+index c59e7ff..9d90408 100644
+--- a/ui/base/ime/win/tsf_bridge.cc
++++ b/ui/base/ime/win/tsf_bridge.cc
+@@ -21,6 +21,7 @@
+ #include "base/threading/thread_local.h"
+ #include "base/trace_event/trace_event.h"
+ #include "base/win/scoped_variant.h"
++#include "base/win/windows_version.h"
+ #include "ui/base/ime/ime_key_event_dispatcher.h"
+ #include "ui/base/ime/text_input_client.h"
+ #include "ui/base/ime/win/mock_tsf_bridge.h"
+@@ -724,6 +725,12 @@ HRESULT TSFBridge::Initialize() {
+     return S_OK;
+   }
+ 
++  // If we aren't supporting TSF early out.
++  if (!base::FeatureList::IsEnabled(features::kTSFImeSupport) ||
++      base::win::GetVersion() < base::win::Version::WIN8) {
++    return E_FAIL;
++  }
++
+   auto delegate = std::make_unique<TSFBridgeImpl>();
+   HRESULT hr = delegate->Initialize();
+   if (SUCCEEDED(hr)) {
+@@ -737,6 +744,9 @@ void TSFBridge::InitializeForTesting() {
+   if (!base::CurrentUIThread::IsSet()) {
+     return;
+   }
++  if (!base::FeatureList::IsEnabled(features::kTSFImeSupport)) {
++    return;
++  }
+   ReplaceThreadLocalTSFBridge(std::make_unique<MockTSFBridge>());
+ }
+ 
+diff --git a/ui/base/ime/win/tsf_input_scope.cc b/ui/base/ime/win/tsf_input_scope.cc
+index 695f8ec..85928ea 100644
+--- a/ui/base/ime/win/tsf_input_scope.cc
++++ b/ui/base/ime/win/tsf_input_scope.cc
+@@ -19,6 +19,7 @@
+ #include "base/compiler_specific.h"
+ #include "base/task/current_thread.h"
+ #include "base/trace_event/trace_event.h"
++#include "base/win/windows_version.h"
+ 
+ namespace ui::tsf_inputscope {
+ namespace {
+@@ -110,6 +111,17 @@ class TSFInputScope final : public ITfInputScope {
+   volatile ULONG ref_count_;
+ };
+ 
++typedef HRESULT(WINAPI* SetInputScopesFunc)(HWND window_handle,
++                                            const InputScope* input_scope_list,
++                                            UINT num_input_scopes,
++                                            WCHAR**, /* unused */
++                                            UINT,    /* unused */
++                                            WCHAR*,  /* unused */
++                                            WCHAR* /* unused */);
++
++SetInputScopesFunc g_set_input_scopes = NULL;
++bool g_get_proc_done = false;
++
+ InputScope ConvertTextInputTypeToInputScope(TextInputType text_input_type) {
+   // Following mapping is based in IE10 on Windows 8.
+   switch (text_input_type) {
+@@ -151,6 +163,26 @@ InputScope ConvertTextInputModeToInputScope(TextInputMode text_input_mode) {
+ 
+ }  // namespace
+ 
++void InitializeTsfForInputScopes() {
++  DCHECK(base::CurrentUIThread::IsSet());
++  // Thread safety is not required because this function is under UI thread.
++  if (!g_get_proc_done) {
++    g_get_proc_done = true;
++
++    // For stability reasons, we do not support Windows XP.
++    if (base::win::GetVersion() < base::win::Version::VISTA) {
++      return;
++    }
++
++    HMODULE module = NULL;
++    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"msctf.dll",
++                           &module)) {
++      g_set_input_scopes = reinterpret_cast<SetInputScopesFunc>(
++          GetProcAddress(module, "SetInputScopes"));
++    }
++  }
++}
++
+ std::vector<InputScope> GetInputScopes(TextInputType text_input_type,
+                                        TextInputMode text_input_mode) {
+   std::vector<InputScope> input_scopes;
+@@ -180,6 +212,20 @@ ITfInputScope* CreateInputScope(TextInputType text_input_type,
+   return new TSFInputScope(input_scopes);
+ }
+ 
++void SetInputScopeForTsfUnawareWindow(HWND window_handle,
++                                      TextInputType text_input_type,
++                                      TextInputMode text_input_mode) {
++  if (!g_set_input_scopes) {
++    return;
++  }
++
++  std::vector<InputScope> input_scopes =
++      GetInputScopes(text_input_type, text_input_mode);
++  g_set_input_scopes(window_handle, &input_scopes[0],
++                     static_cast<UINT>(input_scopes.size()), NULL, 0, NULL,
++                     NULL);
++}
++
+ typedef HRESULT(WINAPI* SetInputScopeFunc)(HWND window_handle,
+                                            InputScope input_scope);
+ 
+diff --git a/ui/base/ime/win/tsf_input_scope.h b/ui/base/ime/win/tsf_input_scope.h
+index ab79f15..52e7869 100644
+--- a/ui/base/ime/win/tsf_input_scope.h
++++ b/ui/base/ime/win/tsf_input_scope.h
+@@ -16,6 +16,11 @@
+ namespace ui {
+ namespace tsf_inputscope {
+ 
++// Initializes the TSF for input scopes. It loads the tsf dll and get the
++// function pointer for setting the input scopes in TSF.
++// Does nothing on Windows XP.
++COMPONENT_EXPORT(UI_BASE_IME_WIN) void InitializeTsfForInputScopes();
++
+ // Returns InputScope list corresoponding to ui::TextInputType and
+ // ui::TextInputMode.
+ // This function is only used from following functions but declared for test.
+@@ -34,6 +39,15 @@ ITfInputScope* CreateInputScope(TextInputType text_input_type,
+                                 TextInputMode text_input_mode,
+                                 bool should_do_learning);
+ 
++// A wrapper of the SetInputScopes API exported by msctf.dll.
++// http://msdn.microsoft.com/en-us/library/windows/desktop/ms629026.aspx
++// Does nothing on Windows XP in case TSF is disabled.
++// NOTE: For TSF-aware window, you should use ITfInputScope instead.
++COMPONENT_EXPORT(UI_BASE_IME_WIN)
++void SetInputScopeForTsfUnawareWindow(HWND window_handle,
++                                      TextInputType text_input_type,
++                                      TextInputMode text_input_mode);
++
+ // A wrapper of the SetInputScope API exported by msctf.dll.
+ COMPONENT_EXPORT(UI_BASE_IME_WIN)
+ void SetInputScope(HWND window_handle, InputScope input_scope);
+diff --git a/ui/base/ui_base_features.cc b/ui/base/ui_base_features.cc
+index c5e2e8f..22baf4c 100644
+--- a/ui/base/ui_base_features.cc
++++ b/ui/base/ui_base_features.cc
+@@ -43,6 +43,10 @@ BASE_FEATURE_PARAM(bool,
+ // If enabled, calculate native window occlusion - Windows-only.
+ BASE_FEATURE(kCalculateNativeWinOcclusion, base::FEATURE_ENABLED_BY_DEFAULT);
+ 
++// Enables using TSF (over IMM32) for IME. TSF is only used on Windows 8 and
++// newer; older Windows always use IMM32.
++BASE_FEATURE(kTSFImeSupport, base::FEATURE_ENABLED_BY_DEFAULT);
++
+ // Once enabled, the exact behavior is dictated by the field trial param
+ // name `kApplyNativeOcclusionToCompositorType`.
+ BASE_FEATURE(kApplyNativeOcclusionToCompositor,
+diff --git a/ui/base/ui_base_features.h b/ui/base/ui_base_features.h
+index e0aa166..7752f3d 100644
+--- a/ui/base/ui_base_features.h
++++ b/ui/base/ui_base_features.h
+@@ -47,6 +47,9 @@ BASE_DECLARE_FEATURE(kLimitScrollDeltaToScrollerSize);
+ COMPONENT_EXPORT(UI_BASE_FEATURES)
+ BASE_DECLARE_FEATURE(kCalculateNativeWinOcclusion);
+ 
++COMPONENT_EXPORT(UI_BASE_FEATURES)
++BASE_DECLARE_FEATURE(kTSFImeSupport);
++
+ COMPONENT_EXPORT(UI_BASE_FEATURES) BASE_DECLARE_FEATURE(kPointerEventsForTouch);
+ 
+ // Returns true if the system should use WM_POINTER events for touch events.
+diff --git a/ui/gfx/image/image_skia.cc b/ui/gfx/image/image_skia.cc
+index 1d56eed..805d2e5 100644
+--- a/ui/gfx/image/image_skia.cc
++++ b/ui/gfx/image/image_skia.cc
+@@ -251,7 +251,11 @@ std::vector<ImageSkiaRep>::const_iterator ImageSkiaStorage::FindRepresentation(
+     }
+     if (scale != resource_scale) {
+       auto iter = FindRepresentation(resource_scale, fetch_new_image);
+-      CHECK(iter != image_reps_.end());
++      // The source may have no image at the resource scale (e.g. at
++      // fractional device scale factors); callers handle end().
++      if (iter == image_reps_.end()) {
++        return image_reps_.end();
++      }
+       image = iter->unscaled() ? (*iter) : ScaleImageSkiaRep(*iter, scale);
+     } else {
+       image = source_->GetImageForScale(scale);
+diff --git a/ui/gl/gl_features.cc b/ui/gl/gl_features.cc
+index 3434e8f..6668f12 100644
+--- a/ui/gl/gl_features.cc
++++ b/ui/gl/gl_features.cc
+@@ -337,7 +337,9 @@ bool IsSwiftShaderAllowed(const base::CommandLine* command_line) {
+ BASE_FEATURE(kAllowD3D11WarpFallback, base::FEATURE_ENABLED_BY_DEFAULT);
+ 
+ bool IsWARPAllowed(const base::CommandLine* command_line) {
+-  if (command_line->HasSwitch(switches::kDisableD3D11Warp)) {
++  // No D3D11 WARP fallback before Windows 8.
++  if (command_line->HasSwitch(switches::kDisableD3D11Warp) ||
++      base::win::GetVersion() < base::win::Version::WIN8) {
+     return false;
+   }
+   return base::FeatureList::IsEnabled(kAllowD3D11WarpFallback);
+diff --git a/ui/views/BUILD.gn b/ui/views/BUILD.gn
+index c44d479..e374574 100644
+--- a/ui/views/BUILD.gn
++++ b/ui/views/BUILD.gn
+@@ -861,6 +861,15 @@ component("views") {
+       "windows_stationarity_monitor_aura.h",
+     ]
+ 
++    if (is_win) {
++      public += [ "corewm/tooltip_win.h" ]
++      sources += [
++        "corewm/cursor_height_provider_win.cc",
++        "corewm/cursor_height_provider_win.h",
++        "corewm/tooltip_win.cc",
++      ]
++    }
++
+     sources += [
+       "accessibility/accessibility_alert_window.cc",
+       "accessibility/ax_aura_obj_cache.cc",
+diff --git a/ui/views/corewm/cursor_height_provider_win.cc b/ui/views/corewm/cursor_height_provider_win.cc
+new file mode 100644
+index 0000000..d83a0e0
+--- /dev/null
++++ b/ui/views/corewm/cursor_height_provider_win.cc
+@@ -0,0 +1,184 @@
++// Copyright 2014 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifdef UNSAFE_BUFFERS_BUILD
++#pragma allow_unsafe_buffers
++#endif
++
++#include "ui/views/corewm/cursor_height_provider_win.h"
++
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++#include <windows.h>
++
++#include <algorithm>
++#include <map>
++#include <memory>
++
++#include "base/check_op.h"
++#include "base/numerics/safe_conversions.h"
++#include "base/win/scoped_hdc.h"
++
++namespace {
++using PixelData = std::unique_ptr<uint32_t[]>;
++using HeightStorage = std::map<HCURSOR, int>;
++
++const uint32_t kBitsPeruint32 = sizeof(uint32_t) * 8;
++// All bits are 1 for transparent portion of monochromatic mask.
++constexpr uint32_t kTransparentMask = 0xffffffff;
++// This is height of default pointer arrow in Windows 7.
++constexpr int kDefaultHeight = 20;
++// Masks are monochromatic.
++constexpr size_t kNumberOfColors = 2;
++const size_t kHeaderAndPalette =
++    sizeof(BITMAPINFOHEADER) + kNumberOfColors * sizeof(RGBQUAD);
++
++HeightStorage* cached_heights = nullptr;
++
++// Extracts the pixel data of provided bitmap
++PixelData GetBitmapData(HBITMAP handle, const BITMAPINFO& info, HDC hdc) {
++  PixelData data;
++  // Masks are monochromatic.
++  DCHECK_EQ(info.bmiHeader.biBitCount, 1);
++  if (info.bmiHeader.biBitCount != 1)
++    return data;
++
++  // When getting pixel data palette is appended to memory pointed by
++  // BITMAPINFO passed so allocate additional memory to store additional data.
++  auto header = std::make_unique<char[]>(kHeaderAndPalette);
++  memcpy(header.get(), &(info.bmiHeader), sizeof(info.bmiHeader));
++
++  data = std::make_unique<uint32_t[]>(info.bmiHeader.biSizeImage /
++                                      sizeof(uint32_t));
++
++  int result = GetDIBits(
++      hdc, handle, 0, static_cast<UINT>(info.bmiHeader.biHeight), data.get(),
++      reinterpret_cast<BITMAPINFO*>(header.get()), DIB_RGB_COLORS);
++
++  if (result == 0)
++    data.reset();
++
++  return data;
++}
++
++// Checks if the specifed row is transparent in provided bitmap.
++bool IsRowTransparent(const PixelData& data,
++                      const uint32_t row_size,
++                      const uint32_t last_byte_mask,
++                      const uint32_t y) {
++  // Set the padding bits to 1 to make mask matching easier.
++  *(data.get() + (y + 1) * row_size - 1) |= last_byte_mask;
++  for (uint32_t i = y * row_size; i < (y + 1) * row_size; ++i) {
++    if (*(data.get() + i) != kTransparentMask)
++      return false;
++  }
++  return true;
++}
++
++// Gets the vertical offset between specified cursor's hotpoint and its bottom.
++//
++// Gets the cursor image data and extract cursor's visible height.
++// Based on that gets what should be the vertical offset between cursor's
++// hot point and the tooltip.
++int CalculateCursorHeight(HCURSOR cursor_handle) {
++  base::win::ScopedGetDC hdc(nullptr);
++
++  ICONINFO icon = {0};
++  GetIconInfo(cursor_handle, &icon);
++
++  BITMAPINFO bitmap_info = {};
++  bitmap_info.bmiHeader.biSize = sizeof(bitmap_info.bmiHeader);
++  if (GetDIBits(hdc, icon.hbmMask, 0, 0, nullptr, &bitmap_info,
++                DIB_RGB_COLORS) == 0)
++    return kDefaultHeight;
++
++  // Rows are padded to full DWORDs. OR with this mask will set them to 1
++  // to simplify matching with |transparent_mask|.
++  uint32_t last_byte_mask = 0xFFFFFFFF;
++  const auto width = static_cast<uint32_t>(bitmap_info.bmiHeader.biWidth);
++  const unsigned char bits_to_shift =
++      sizeof(last_byte_mask) * 8 - (width % kBitsPeruint32);
++  if (bits_to_shift != kBitsPeruint32)
++    last_byte_mask = (last_byte_mask << bits_to_shift);
++  else
++    last_byte_mask = 0;
++
++  const uint32_t row_size = (width + kBitsPeruint32 - 1) / kBitsPeruint32;
++  PixelData data(GetBitmapData(icon.hbmMask, bitmap_info, hdc));
++  if (data == nullptr)
++    return kDefaultHeight;
++
++  // There are 2 types of cursors: Ones that cover the area underneath
++  // completely (i.e. hand cursor) and ones that partially cover
++  // and partially blend with background (i. e. I-beam cursor).
++  // These will have either 1 square mask or 2 masks stacked on top
++  // of each other (xor mask and and mask).
++  const bool has_xor_mask =
++      bitmap_info.bmiHeader.biHeight == 2 * bitmap_info.bmiHeader.biWidth;
++  const auto height = static_cast<uint32_t>(bitmap_info.bmiHeader.biHeight);
++  const uint32_t cursor_height = has_xor_mask ? height / 2 : height;
++  uint32_t xor_offset;
++  if (has_xor_mask) {
++    for (xor_offset = 0; xor_offset < cursor_height; ++xor_offset) {
++      const uint32_t row_start = row_size * xor_offset;
++      const uint32_t row_boundary = row_start + row_size;
++      for (uint32_t i = row_start; i < row_boundary; ++i)
++        data.get()[i] = ~(data.get()[i]);
++      if (!IsRowTransparent(data, row_size, last_byte_mask, xor_offset)) {
++        break;
++      }
++    }
++  } else {
++    xor_offset = cursor_height;
++  }
++
++  uint32_t and_offset;
++
++  for (and_offset = has_xor_mask ? cursor_height : 0; and_offset < height;
++       ++and_offset) {
++    if (!IsRowTransparent(data, row_size, last_byte_mask, and_offset)) {
++      break;
++    }
++  }
++  if (has_xor_mask) {
++    and_offset -= cursor_height;
++  }
++  const uint32_t offset = std::min(xor_offset, and_offset);
++
++  DeleteObject(icon.hbmColor);
++  DeleteObject(icon.hbmMask);
++
++  // Apparently it's possible for the calculation here to underflow, and thus
++  // result in a negative value, maybe if the hotspot is below any visible
++  // portion of the cursor.  Not sure if this case should return 0 instead.
++  return static_cast<int>(cursor_height - offset - icon.yHotspot + 1);
++}
++
++}  // namespace
++
++namespace views {
++namespace corewm {
++
++int GetCurrentCursorVisibleHeight() {
++  CURSORINFO cursor = {0};
++  cursor.cbSize = sizeof(cursor);
++  GetCursorInfo(&cursor);
++
++  if (cached_heights == nullptr)
++    cached_heights = new HeightStorage;
++
++  HeightStorage::const_iterator cached_height =
++      cached_heights->find(cursor.hCursor);
++  if (cached_height != cached_heights->end())
++    return cached_height->second;
++
++  const int height = CalculateCursorHeight(cursor.hCursor);
++  (*cached_heights)[cursor.hCursor] = height;
++
++  return height;
++}
++
++}  // namespace corewm
++}  // namespace views
+diff --git a/ui/views/corewm/cursor_height_provider_win.h b/ui/views/corewm/cursor_height_provider_win.h
+new file mode 100644
+index 0000000..ce0bf65
+--- /dev/null
++++ b/ui/views/corewm/cursor_height_provider_win.h
+@@ -0,0 +1,21 @@
++// Copyright 2014 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef UI_VIEWS_COREWM_CURSOR_HEIGHT_PROVIDER_WIN_H_
++#define UI_VIEWS_COREWM_CURSOR_HEIGHT_PROVIDER_WIN_H_
++
++namespace views {
++namespace corewm {
++
++// Gets the visible height of current cursor.
++//
++// The height is offset between cursor's hot point and it's
++// bottom edge, derived from first non-transparent row of cursor's mask.
++
++int GetCurrentCursorVisibleHeight();
++
++}  // namespace corewm
++}  // namespace views
++
++#endif  // UI_VIEWS_COREWM_CURSOR_HEIGHT_PROVIDER_WIN_H_
+diff --git a/ui/views/corewm/tooltip_win.cc b/ui/views/corewm/tooltip_win.cc
+new file mode 100644
+index 0000000..9a05f45
+--- /dev/null
++++ b/ui/views/corewm/tooltip_win.cc
+@@ -0,0 +1,173 @@
++// Copyright 2013 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifdef UNSAFE_BUFFERS_BUILD
++// TODO(crbug.com/351564777): Remove this and convert code to safer constructs.
++#pragma allow_unsafe_buffers
++#endif
++
++#include "ui/views/corewm/tooltip_win.h"
++
++#include <string.h>
++
++#include "base/i18n/rtl.h"
++#include "base/logging.h"
++#include "base/strings/string_util_win.h"
++#include "ui/aura/window.h"
++#include "ui/display/display.h"
++#include "ui/display/screen.h"
++#include "ui/display/win/screen_win.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/views/corewm/cursor_height_provider_win.h"
++
++namespace views::corewm {
++
++TooltipWin::TooltipWin(HWND parent)
++    : parent_hwnd_(parent), tooltip_hwnd_(nullptr), showing_(false) {
++  memset(&toolinfo_, 0, sizeof(toolinfo_));
++  toolinfo_.cbSize = sizeof(toolinfo_);
++  toolinfo_.uFlags = TTF_IDISHWND | TTF_TRACK | TTF_ABSOLUTE;
++  toolinfo_.uId = reinterpret_cast<UINT_PTR>(parent_hwnd_);
++  toolinfo_.hwnd = parent_hwnd_;
++  toolinfo_.lpszText = nullptr;
++  toolinfo_.lpReserved = nullptr;
++  SetRectEmpty(&toolinfo_.rect);
++}
++
++TooltipWin::~TooltipWin() {
++  if (tooltip_hwnd_) {
++    DestroyWindow(tooltip_hwnd_);
++  }
++}
++
++bool TooltipWin::HandleNotify(int w_param, NMHDR* l_param, LRESULT* l_result) {
++  if (tooltip_hwnd_ == nullptr) {
++    return false;
++  }
++
++  switch (l_param->code) {
++    case TTN_POP:
++      showing_ = false;
++      return true;
++    case TTN_SHOW:
++      *l_result = TRUE;
++      PositionTooltip();
++      showing_ = true;
++      return true;
++    default:
++      break;
++  }
++  return false;
++}
++
++bool TooltipWin::EnsureTooltipWindow() {
++  if (tooltip_hwnd_) {
++    return true;
++  }
++
++  // The RTL extended style is what l10n_util::GetExtendedTooltipStyles() used
++  // to return.
++  tooltip_hwnd_ = CreateWindowEx(
++      WS_EX_TRANSPARENT | (base::i18n::IsRTL() ? WS_EX_LAYOUTRTL : 0),
++      TOOLTIPS_CLASS, nullptr, TTS_NOPREFIX | WS_POPUP, 0, 0, 0, 0,
++      parent_hwnd_, nullptr, nullptr, nullptr);
++  if (!tooltip_hwnd_) {
++    PLOG(WARNING) << "tooltip creation failed, disabling tooltips";
++    return false;
++  }
++
++  // No font override: the l10n_util helpers upstream used for it no longer
++  // exist, so the tooltip keeps the system font (as in Supermium 144).
++
++  SendMessage(tooltip_hwnd_, TTM_ADDTOOL, 0,
++              reinterpret_cast<LPARAM>(&toolinfo_));
++  return true;
++}
++
++void TooltipWin::PositionTooltip() {
++  gfx::Point screen_point =
++      display::win::GetScreenWin()->DIPToScreenPoint(anchor_point_);
++  const int cursoroffset = GetCurrentCursorVisibleHeight();
++  screen_point.Offset(0, cursoroffset);
++
++  LRESULT tooltip_size = SendMessage(tooltip_hwnd_, TTM_GETBUBBLESIZE, 0,
++                                     reinterpret_cast<LPARAM>(&toolinfo_));
++  const gfx::Size size(LOWORD(tooltip_size), HIWORD(tooltip_size));
++
++  const display::Display display(
++      display::Screen::Get()->GetDisplayNearestPoint(anchor_point_));
++
++  gfx::Rect tooltip_bounds(screen_point, size);
++  // Align the center of the tooltip with the position when the tooltip is not
++  // following the cursor.
++  if (trigger_ == TooltipTrigger::kKeyboard) {
++    tooltip_bounds.Offset(-size.width() / 2, 0);
++  } else if (base::i18n::IsRTL()) {
++    tooltip_bounds.Offset(-size.width(), 0);
++  }
++  tooltip_bounds.AdjustToFit(display::win::GetScreenWin()->DIPToScreenRect(
++      parent_hwnd_, display.work_area()));
++  SetWindowPos(tooltip_hwnd_, nullptr, tooltip_bounds.x(), tooltip_bounds.y(),
++               0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
++}
++
++int TooltipWin::GetMaxWidth(const gfx::Point& location) const {
++  const gfx::Point screen_point =
++      display::win::GetScreenWin()->DIPToScreenPoint(location);
++  display::Display display(
++      display::Screen::Get()->GetDisplayNearestPoint(screen_point));
++  const gfx::Rect monitor_bounds = display.bounds();
++  return (monitor_bounds.width() + 1) / 2;
++}
++
++void TooltipWin::Update(aura::Window* window,
++                        const std::u16string& tooltip_text,
++                        const gfx::Point& position,
++                        const TooltipTrigger trigger) {
++  if (!EnsureTooltipWindow()) {
++    return;
++  }
++
++  // See comment in header for details on why `anchor_point_` and `trigger_` are
++  // needed here.
++  anchor_point_ = position + window->GetBoundsInScreen().OffsetFromOrigin();
++  trigger_ = trigger;
++
++  std::u16string adjusted_text(tooltip_text);
++  base::i18n::AdjustStringForLocaleDirection(&adjusted_text);
++  toolinfo_.lpszText = base::as_writable_wcstr(adjusted_text);
++  SendMessage(tooltip_hwnd_, TTM_SETTOOLINFO, 0,
++              reinterpret_cast<LPARAM>(&toolinfo_));
++
++  int max_width = GetMaxWidth(anchor_point_);
++  SendMessage(tooltip_hwnd_, TTM_SETMAXTIPWIDTH, 0, max_width);
++}
++
++void TooltipWin::Show() {
++  if (!EnsureTooltipWindow()) {
++    return;
++  }
++
++  SendMessage(tooltip_hwnd_, TTM_TRACKACTIVATE, TRUE,
++              reinterpret_cast<LPARAM>(&toolinfo_));
++
++  // Bring the window to the front.
++  SetWindowPos(tooltip_hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
++               SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOOWNERZORDER | SWP_NOSIZE);
++}
++
++void TooltipWin::Hide() {
++  if (!tooltip_hwnd_) {
++    return;
++  }
++
++  SendMessage(tooltip_hwnd_, TTM_TRACKACTIVATE, FALSE,
++              reinterpret_cast<LPARAM>(&toolinfo_));
++}
++
++bool TooltipWin::IsVisible() {
++  return showing_;
++}
++
++}  // namespace views::corewm
+diff --git a/ui/views/corewm/tooltip_win.h b/ui/views/corewm/tooltip_win.h
+new file mode 100644
+index 0000000..490f6c9
+--- /dev/null
++++ b/ui/views/corewm/tooltip_win.h
+@@ -0,0 +1,80 @@
++// Copyright 2013 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef UI_VIEWS_COREWM_TOOLTIP_WIN_H_
++#define UI_VIEWS_COREWM_TOOLTIP_WIN_H_
++
++#include <windows.h>  // Must come before other Windows system headers.
++
++#include <commctrl.h>
++
++#include <string>
++
++#include "ui/gfx/geometry/point.h"
++#include "ui/views/corewm/tooltip.h"
++
++namespace wm {
++class TooltipObserver;
++}
++
++namespace views::corewm {
++
++// Implementation of Tooltip that uses the native win32 control for showing the
++// tooltip.
++class VIEWS_EXPORT TooltipWin : public Tooltip {
++ public:
++  explicit TooltipWin(HWND parent);
++
++  TooltipWin(const TooltipWin&) = delete;
++  TooltipWin& operator=(const TooltipWin&) = delete;
++
++  ~TooltipWin() override;
++
++  void AddObserver(wm::TooltipObserver* observer) override {}
++  void RemoveObserver(wm::TooltipObserver* observer) override {}
++
++  // HandleNotify() is forwarded from DesktopWindowTreeHostWin to keep the
++  // native tooltip in sync.
++  bool HandleNotify(int w_param, NMHDR* l_param, LRESULT* l_result);
++
++ private:
++  // Ensures |tooltip_hwnd_| is valid. Returns true if valid, false if there
++  // a problem creating |tooltip_hwnd_|.
++  bool EnsureTooltipWindow();
++
++  // Sets the position of the tooltip.
++  void PositionTooltip();
++
++  // Tooltip:
++  int GetMaxWidth(const gfx::Point& location) const override;
++  void Update(aura::Window* window,
++              const std::u16string& tooltip_text,
++              const gfx::Point& position,
++              const TooltipTrigger trigger) override;
++  void Show() override;
++  void Hide() override;
++  bool IsVisible() override;
++
++  // The window |tooltip_hwnd_| is parented to.
++  HWND parent_hwnd_;
++
++  // Shows the tooltip.
++  HWND tooltip_hwnd_;
++
++  // Used to modify the tooltip.
++  TOOLINFO toolinfo_;
++
++  // Is the tooltip showing?
++  bool showing_;
++
++  // In order to position the tooltip we need to know the size. The size is only
++  // available from TTN_SHOW, so we have to cache `anchor_point_` and `trigger_`
++  // which are required to calculate its position.
++  gfx::Point anchor_point_;
++  TooltipTrigger trigger_ = TooltipTrigger::kCursor;
++};
++
++}  // namespace views::corewm
++
++#endif  // UI_VIEWS_COREWM_TOOLTIP_WIN_H_
+diff --git a/ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc b/ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc
+index 12ab1fa..0bcfbd2 100644
+--- a/ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc
++++ b/ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc
+@@ -56,6 +56,7 @@
+ #include "ui/gfx/native_ui_types.h"
+ #include "ui/gfx/path_win.h"
+ #include "ui/views/corewm/tooltip_aura.h"
++#include "ui/views/corewm/tooltip_win.h"
+ #include "ui/views/views_features.h"
+ #include "ui/views/views_switches.h"
+ #include "ui/views/widget/desktop_aura/desktop_drag_drop_client_win.h"
+@@ -271,7 +272,19 @@ void DesktopWindowTreeHostWin::SetBackgroundColor(SkColor background_color) {
+ }
+ 
+ std::unique_ptr<corewm::Tooltip> DesktopWindowTreeHostWin::CreateTooltip() {
+-  return std::make_unique<corewm::TooltipAura>();
++  // Native Win32 tooltips are the default before Windows 8 and can be forced
++  // with --legacy-tooltips-win.
++  const bool force_legacy_tooltips =
++      base::win::GetVersion() < base::win::Version::WIN8 ||
++      base::CommandLine::ForCurrentProcess()->HasSwitch("legacy-tooltips-win");
++  if (!force_legacy_tooltips) {
++    return std::make_unique<corewm::TooltipAura>();
++  }
++
++  DCHECK(!tooltip_);
++  auto tooltip = std::make_unique<corewm::TooltipWin>(GetAcceleratedWidget());
++  tooltip_ = tooltip.get();
++  return tooltip;
+ }
+ 
+ std::unique_ptr<aura::client::DragDropClient>
+@@ -1127,6 +1140,8 @@ void DesktopWindowTreeHostWin::HandleDestroying() {
+ }
+ 
+ void DesktopWindowTreeHostWin::HandleDestroyed() {
++  // OnHostClosed() destroys the TooltipController, which owns |tooltip_|.
++  tooltip_ = nullptr;
+   desktop_native_widget_aura_->OnHostClosed();
+ }
+ 
+@@ -1386,6 +1401,12 @@ void DesktopWindowTreeHostWin::HandlePaintAccelerated(
+   }
+ }
+ 
++bool DesktopWindowTreeHostWin::HandleTooltipNotify(int w_param,
++                                                   NMHDR* l_param,
++                                                   LRESULT* l_result) {
++  return tooltip_ && tooltip_->HandleNotify(w_param, l_param, l_result);
++}
++
+ void DesktopWindowTreeHostWin::HandleMenuLoop(bool in_menu_loop) {
+   if (in_menu_loop) {
+     tooltip_disabler_ = std::make_unique<wm::ScopedTooltipDisabler>(window());
+diff --git a/ui/views/widget/desktop_aura/desktop_window_tree_host_win.h b/ui/views/widget/desktop_aura/desktop_window_tree_host_win.h
+index 829f6c9..fbc90b0 100644
+--- a/ui/views/widget/desktop_aura/desktop_window_tree_host_win.h
++++ b/ui/views/widget/desktop_aura/desktop_window_tree_host_win.h
+@@ -45,6 +45,10 @@ namespace test {
+ class DesktopWindowTreeHostWinTestApi;
+ }
+ 
++namespace corewm {
++class TooltipWin;
++}
++
+ class VIEWS_EXPORT DesktopWindowTreeHostWin
+     : public DesktopWindowTreeHost,
+       public wm::AnimationHost,
+@@ -268,6 +272,9 @@ class VIEWS_EXPORT DesktopWindowTreeHostWin
+   void HandleInputLanguageChange(DWORD character_set,
+                                  HKL input_language_id) override;
+   void HandlePaintAccelerated(const gfx::Rect& invalid_rect) override;
++  bool HandleTooltipNotify(int w_param,
++                           NMHDR* l_param,
++                           LRESULT* l_result) override;
+   void HandleMenuLoop(bool in_menu_loop) override;
+   bool PreHandleMSG(UINT message,
+                     WPARAM w_param,
+@@ -351,6 +358,10 @@ class VIEWS_EXPORT DesktopWindowTreeHostWin
+   // Init time, before the Widget has created the NonClientView.
+   bool has_non_client_view_;
+ 
++  // Owned by TooltipController, but we need to forward events to it so we keep
++  // a reference. Only set when native tooltips are used.
++  raw_ptr<corewm::TooltipWin> tooltip_ = nullptr;
++
+   // True if the window should have the frame removed.
+   bool remove_standard_frame_;
+ 
+diff --git a/ui/views/win/hwnd_message_handler.cc b/ui/views/win/hwnd_message_handler.cc
+index 478b9a9..30f8c54 100644
+--- a/ui/views/win/hwnd_message_handler.cc
++++ b/ui/views/win/hwnd_message_handler.cc
+@@ -2730,6 +2730,12 @@ LRESULT HWNDMessageHandler::OnNCUAHDrawFrame(UINT message,
+   return 0;
+ }
+ 
++LRESULT HWNDMessageHandler::OnNotify(int w_param, NMHDR* l_param) {
++  LRESULT l_result = 0;
++  SetMsgHandled(delegate_->HandleTooltipNotify(w_param, l_param, &l_result));
++  return l_result;
++}
++
+ void HWNDMessageHandler::OnPaint(HDC dc) {
+   // Call BeginPaint()/EndPaint() around the paint handling, as that seems
+   // to do more to actually validate the window's drawing region. This only
+diff --git a/ui/views/win/hwnd_message_handler.h b/ui/views/win/hwnd_message_handler.h
+index caa4d6f..6d8521f 100644
+--- a/ui/views/win/hwnd_message_handler.h
++++ b/ui/views/win/hwnd_message_handler.h
+@@ -508,6 +508,7 @@ class VIEWS_EXPORT HWNDMessageHandler : public gfx::WindowImpl,
+     CR_MSG_WM_NCCREATE(OnNCCreate)
+     CR_MSG_WM_NCHITTEST(OnNCHitTest)
+     CR_MSG_WM_NCPAINT(OnNCPaint)
++    CR_MSG_WM_NOTIFY(OnNotify)
+     CR_MSG_WM_PAINT(OnPaint)
+     CR_MSG_WM_SETFOCUS(OnSetFocus)
+     CR_MSG_WM_SETICON(OnSetIcon)
+@@ -564,6 +565,7 @@ class VIEWS_EXPORT HWNDMessageHandler : public gfx::WindowImpl,
+   void OnNCPaint(HRGN rgn);
+   LRESULT OnNCUAHDrawCaption(UINT message, WPARAM w_param, LPARAM l_param);
+   LRESULT OnNCUAHDrawFrame(UINT message, WPARAM w_param, LPARAM l_param);
++  LRESULT OnNotify(int w_param, NMHDR* l_param);
+   void OnPaint(HDC dc);
+   LRESULT OnReflectedMessage(UINT message, WPARAM w_param, LPARAM l_param);
+   LRESULT OnScrollMessage(UINT message, WPARAM w_param, LPARAM l_param);
+diff --git a/ui/views/win/hwnd_message_handler_delegate.h b/ui/views/win/hwnd_message_handler_delegate.h
+index 32c88e9..2edc695 100644
+--- a/ui/views/win/hwnd_message_handler_delegate.h
++++ b/ui/views/win/hwnd_message_handler_delegate.h
+@@ -226,6 +226,11 @@ class VIEWS_EXPORT HWNDMessageHandlerDelegate {
+   // Called to compel the delegate to paint |invalid_rect| accelerated.
+   virtual void HandlePaintAccelerated(const gfx::Rect& invalid_rect) = 0;
+ 
++  // Called to forward a WM_NOTIFY message to the tooltip manager.
++  virtual bool HandleTooltipNotify(int w_param,
++                                   NMHDR* l_param,
++                                   LRESULT* l_result) = 0;
++
+   // Invoked on entering/exiting a menu loop.
+   virtual void HandleMenuLoop(bool in_menu_loop) = 0;
+ 
+diff --git a/ui/views/win/hwnd_message_handler_interactive_uitest.cc b/ui/views/win/hwnd_message_handler_interactive_uitest.cc
+index 9843157..032cd34 100644
+--- a/ui/views/win/hwnd_message_handler_interactive_uitest.cc
++++ b/ui/views/win/hwnd_message_handler_interactive_uitest.cc
+@@ -119,6 +119,11 @@ class TestHWNDMessageHandlerDelegate : public HWNDMessageHandlerDelegate {
+   void HandleInputLanguageChange(DWORD character_set,
+                                  HKL input_language_id) override {}
+   void HandlePaintAccelerated(const gfx::Rect& invalid_rect) override {}
++  bool HandleTooltipNotify(int w_param,
++                           NMHDR* l_param,
++                           LRESULT* l_result) override {
++    return false;
++  }
+   void HandleMenuLoop(bool in_menu_loop) override {}
+   bool PreHandleMSG(UINT message,
+                     WPARAM w_param,

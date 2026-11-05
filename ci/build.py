@@ -62,6 +62,8 @@ SRC_PATCHES = [
     'ptr_device_fix.patch',
     'quic_fix.patch',
     'touch_device_support_win7.patch',
+    'restore_from_144.patch',
+    'supermium_branding.patch',
 ]
 # Patches for the separate repositories that DEPS checks out below src/.
 SUBREPO_PATCHES = [
