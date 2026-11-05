@@ -225,10 +225,18 @@ index 2e0f7cc..3ed6fb6 100644
    {
      "name": "media-router-cast-allow-all-ips",
 diff --git a/chrome/browser/obsolete_system/obsolete_system_win.cc b/chrome/browser/obsolete_system/obsolete_system_win.cc
-index 689026a..60231c2 100644
+index 689026a..02f5f77 100644
 --- a/chrome/browser/obsolete_system/obsolete_system_win.cc
 +++ b/chrome/browser/obsolete_system/obsolete_system_win.cc
-@@ -22,16 +22,13 @@ base::win::Version GetRealOSVersion() {
+@@ -7,7 +7,6 @@
+ #include "base/cpu.h"
+ #include "base/win/windows_version.h"
+ #include "build/build_config.h"
+-#include "chrome/common/chrome_version.h"
+ #include "chrome/common/url_constants.h"
+ #include "chrome/grit/branded_strings.h"
+ #include "ui/base/l10n/l10n_util.h"
+@@ -22,16 +21,13 @@ base::win::Version GetRealOSVersion() {
    return base::win::OSInfo::Kernel32Version();
  }
  
@@ -247,7 +255,7 @@ index 689026a..60231c2 100644
  }
  
  std::u16string LocalizedObsoleteString() {
-@@ -52,7 +49,7 @@ bool IsEndOfTheLine() {
+@@ -52,7 +48,7 @@ bool IsEndOfTheLine() {
    // M109 was the last milestone to support Win 7/8/8.1, the last deprecated
    // Windows version. Future deprecations should update this to the last
    // milestone that supports the soon-to-be-deprecated Windows version.
