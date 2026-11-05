@@ -13,3 +13,8 @@ ffmpeg_branding = "Chrome"
 treat_warnings_as_errors = false
 # Build with ninja, not siso.
 use_siso = false
+# Don't apply Chromium's field trial testing config
+# (testing/variations/fieldtrial_testing_config.json). Non-Chrome-branded
+# builds turn its experiments on by default; the official Supermium builds
+# don't contain it.
+disable_fieldtrial_testing_config = true
