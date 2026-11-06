@@ -73,6 +73,14 @@ git -C third_party/search_engines_data/resources apply "$SUPERMIUM/search_engine
 * **Браузер собран** с этими патчами для Windows x64 через GitHub Actions (раздел «Сборка через
   GitHub Actions»): все 45 164 шага `chrome` и `mini_installer` прошли без ошибок. Сборка выявила
   одну ошибку компиляции, она исправлена (`url_fixer.cc`, см. «Ошибки сборки»).
+* Со всеми 19 патчами, включая `restore_from_144.patch` и `supermium_branding.patch`, браузер
+  собран ещё раз (прогон 42000307122, 5 этапов): 210 исходников, изменённых патчами, и все
+  45 116 шагов прошли без ошибок. Проверены бинарники:
+  * версия подсистемы PE 5.2 у chrome.exe, chrome.dll и остальных;
+  * ProductName «Supermium», все 31 иконка chrome.exe совпадают с иконками Supermium 144;
+  * chrome.dll отложенно импортирует весь набор IMM32 и содержит класс `tooltips_class32`, а также
+    переключатели `remove-grab-handle`, `old-tab-strip-bounds` и `legacy-tooltips-win`;
+  * тестовой конфигурации полевых испытаний в сборке больше нет.
 * **Работа браузера не проверялась**: на Windows его ещё никто не запускал. Перед релизом его нужно
   проверить на целевых ОС. Особенно это касается изменений песочницы на Windows 7/8/8.1 (раздел
   про `supermium_150_core_sandbox`): сборка шла под Windows 11, а эти пути кода работают только
